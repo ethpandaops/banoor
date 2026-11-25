@@ -16,7 +16,7 @@ func (s *ProblemStatusCode) Error() string {
 
 // Ref: #/components/schemas/Envelope
 type Envelope struct {
-	// Base64 (standard, padded) of the payload JSON bytes; see `Payload`.
+	// Base64 (standard, padded) of the payload JSON bytes.
 	Payload string `json:"payload"`
 	// The armored OpenSSH signature (`-----BEGIN SSH SIGNATURE-----`) over the decoded payload bytes, in
 	// the configured namespace.

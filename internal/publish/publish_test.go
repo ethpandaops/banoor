@@ -3,9 +3,14 @@ package publish
 import (
 	"encoding/base64"
 	"encoding/json"
+	"maps"
+	"slices"
 	"testing"
 	"time"
 
+	"github.com/go-faster/yaml"
+
+	"github.com/ethpandaops/banoor/api"
 	"github.com/ethpandaops/banoor/pkg/engine"
 )
 
@@ -88,6 +93,37 @@ func TestPayloadFormat(t *testing.T) {
 
 	if payload.Version != 1 || payload.Mode != engine.Shadow || payload.GeneratedAt != t0.Unix() || payload.PreviousGeneration != 0 {
 		t.Errorf("payload = %+v", payload)
+	}
+}
+
+// The signed payload and its entries carry exactly the fields the spec's
+// Payload and Entry document.
+func TestPayloadMatchesTheSpec(t *testing.T) {
+	t.Parallel()
+
+	var spec struct {
+		Components struct {
+			Schemas map[string]struct {
+				Properties map[string]any `yaml:"properties"`
+			} `yaml:"schemas"`
+		} `yaml:"components"`
+	}
+	if err := yaml.Unmarshal(api.Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	p := New(&fakeSigner{}, time.Minute, 0, nil)
+	publish(t, p, t0, engine.Enforce, entry("198.51.100.1/32"))
+
+	_, fields := decode(t, p.Current())
+	entries, _ := fields["entries"].([]any)
+	first, _ := entries[0].(map[string]any)
+
+	for name, got := range map[string]map[string]any{"Payload": fields, "Entry": first} {
+		want := slices.Sorted(maps.Keys(spec.Components.Schemas[name].Properties))
+		if keys := slices.Sorted(maps.Keys(got)); len(want) == 0 || !slices.Equal(keys, want) {
+			t.Errorf("%s fields = %v, the spec documents %v", name, keys, want)
+		}
 	}
 }
 
