@@ -75,6 +75,8 @@ func TestValidateRejects(t *testing.T) {
 		"zero weight":             {`"weight": 1`, `"weight": 0`, "weight must be positive"},
 		"ban shorter than window": {`"signals"`, `"ban": {"base": "1h"}, "signals"`, "ban.base 1h0m0s must be at least the window"},
 		"data after":              {`"1h"}]}`, `"1h"}]}}{`, "data after the configuration"},
+		"fetchers no proxies":     {`"allow": {`, `"fetchUserHeader": "X-User", "tables": {"decisions": "s.decisions", "publishes": "s.publishes", "control": "s.control", "fetchers": "s.fetchers"}, "allow": {"fetchers": {"addressHeader": "X-Real-Ip", "users": "^host-", "window": "720h"}, `, `and trustedProxies`},
+		"bad proxy":               {`"signals"`, `"trustedProxies": ["192.0.2.1"], "signals"`, `no '/'`},
 		"bad duration":            {`"signals"`, `"window": 86400, "signals"`, "durations are strings"},
 		"wide ipv6 unit":          {`"signals"`, `"ipv6Prefix": 32, "signals"`, "ipv6Prefix 32"},
 		"other source":            {`"dsn"`, `"type": "postgres", "dsn"`, "only clickhouse"},

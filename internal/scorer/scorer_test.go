@@ -144,6 +144,7 @@ func (f *fakeSource) decisions(withSuppressed bool) []string {
 
 const testConfig = `{
 	"fetchUserHeader": "X-User",
+	"trustedProxies": ["192.0.2.10/32"],
 	"source": {"dsn": "clickhouse://test@127.0.0.1:9000"},
 	"tables": {"decisions": "state.decisions", "publishes": "state.publishes", "control": "state.control", "fetchers": "state.fetchers"},
 	"signing": {"keyFile": "unused", "namespace": "example-list"},
@@ -789,5 +790,42 @@ func TestFetchersKeepTheNewestAddressesPerUser(t *testing.T) {
 
 	if got := cidrs(h.payload()); !slices.Contains(got, "198.51.100.4/32") || slices.Contains(got, "198.51.100.1/32") {
 		t.Fatalf("entries = %v, want .4 banned and .1 allowed", got)
+	}
+}
+
+func TestFetchersAreBounded(t *testing.T) {
+	t.Parallel()
+
+	_, key, _ := ed25519.GenerateKey(rand.Reader)
+	src := testSource()
+
+	// Stored rows that are not one address, or not a named user, are not
+	// restored.
+	src.inserted["state.fetchers"] = [][]any{
+		{t0, "host-a", "0.0.0.0/0"},
+		{t0, "host-a", "198.51.100.1, 198.51.100.4"},
+		{t0, "someone", "198.51.100.4"},
+	}
+
+	h := newHarness(t, src, key, filepath.Join(t.TempDir(), "manual.json"))
+	h.writeManual(`{"entries": []}`)
+
+	// Users past the bound are not recorded.
+	for i := range maxUsers {
+		h.sc.Seen(fmt.Sprintf("host-%d", i), fmt.Sprintf("2001:db8:%x::1", i))
+	}
+
+	h.sc.Seen("host-late", "198.51.100.1")
+
+	if err := h.run(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := cidrs(h.payload()); !slices.Contains(got, "198.51.100.1/32") || !slices.Contains(got, "198.51.100.4/32") {
+		t.Fatalf("entries = %v, want .1 and .4 banned", got)
+	}
+
+	if got := metricsText(t, h.reg); !strings.Contains(got, fmt.Sprintf(`banoor_allowlist_prefixes{list="fetchers"} %d`, maxUsers)) {
+		t.Errorf("metrics:\n%s", got)
 	}
 }

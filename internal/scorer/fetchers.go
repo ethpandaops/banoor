@@ -3,7 +3,6 @@ package scorer
 import (
 	"context"
 	"fmt"
-	"net/netip"
 	"regexp"
 	"sync"
 	"time"
@@ -20,9 +19,23 @@ const storeEvery = time.Hour
 // consumer alternating address families needs two.
 const maxAddressesPerUser = 16
 
-type fetcherKey struct {
+// maxUsers bounds how many users the fetchers allowlist holds, so a
+// credential or proxy that can name any user cannot grow it without end.
+// Past it, a new user is not recorded until one ages out.
+const maxUsers = 4096
+
+// fetch is when a user last fetched from one address, and when that was
+// last stored.
+type fetch struct {
+	seen   time.Time
+	stored time.Time
+}
+
+// fetchRow is a fetch to store.
+type fetchRow struct {
 	user    string
 	address string
+	at      time.Time
 }
 
 // fetchers remembers the addresses consumers fetched the list from.
@@ -30,17 +43,16 @@ type fetchers struct {
 	users  *regexp.Regexp
 	window time.Duration
 
-	mu     sync.Mutex
-	seen   map[fetcherKey]time.Time
-	stored map[fetcherKey]time.Time
+	mu sync.Mutex
+	// byUser maps a user to its addresses.
+	byUser map[string]map[string]*fetch
 }
 
 func newFetchers(users string, window time.Duration) *fetchers {
 	return &fetchers{
 		users:  regexp.MustCompile(users), // checked by config.Validate
 		window: window,
-		seen:   map[fetcherKey]time.Time{},
-		stored: map[fetcherKey]time.Time{},
+		byUser: map[string]map[string]*fetch{},
 	}
 }
 
@@ -48,116 +60,134 @@ func newFetchers(users string, window time.Duration) *fetchers {
 // configuration does not name, and anything that is not one address, are
 // ignored.
 func (s *Scorer) Seen(user, address string) {
-	f := s.fetchers
-	if f == nil || !f.users.MatchString(user) {
-		return
+	if s.fetchers != nil {
+		s.fetchers.put(user, address, s.now().UTC())
+	}
+}
+
+// put records that user fetched from address at t and returns the record,
+// or nil when it was ignored.
+func (f *fetchers) put(user, address string, t time.Time) *fetch {
+	if !f.users.MatchString(user) {
+		return nil
 	}
 
-	a, err := netip.ParseAddr(address)
+	h, err := netaddr.Host(address)
 	if err != nil {
-		return
+		return nil
 	}
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.put(fetcherKey{user: user, address: a.Unmap().WithZone("").String()}, s.now().UTC())
-}
-
-// put records k as seen at t, keeping at most maxAddressesPerUser addresses
-// per user. The caller holds mu.
-func (f *fetchers) put(k fetcherKey, t time.Time) {
-	f.seen[k] = t
-
-	var (
-		n      int
-		oldest fetcherKey
-	)
-
-	for o, ot := range f.seen {
-		if o.user != k.user {
-			continue
+	addrs := f.byUser[user]
+	if addrs == nil {
+		if len(f.byUser) >= maxUsers {
+			return nil
 		}
 
-		if n == 0 || ot.Before(f.seen[oldest]) {
-			oldest = o
+		addrs = map[string]*fetch{}
+		f.byUser[user] = addrs
+	}
+
+	key := h.Addr().String()
+
+	r := addrs[key]
+	if r == nil {
+		r = &fetch{}
+		addrs[key] = r
+	}
+
+	if t.After(r.seen) {
+		r.seen = t
+	}
+
+	if len(addrs) > maxAddressesPerUser {
+		oldest := ""
+		for a, o := range addrs {
+			if oldest == "" || o.seen.Before(addrs[oldest].seen) {
+				oldest = a
+			}
 		}
 
-		n++
+		delete(addrs, oldest)
 	}
 
-	if n > maxAddressesPerUser {
-		delete(f.seen, oldest)
-		delete(f.stored, oldest)
-	}
+	return r
 }
 
-// allowed returns the addresses seen within the window.
+// allowed returns the addresses seen within the window, and forgets the
+// rest.
 func (f *fetchers) allowed(now time.Time) *netaddr.Set {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	set := netaddr.NewSet()
 
-	for k, t := range f.seen {
-		if now.Sub(t) >= f.window {
-			delete(f.seen, k)
-			delete(f.stored, k)
+	for user, addrs := range f.byUser {
+		for a, r := range addrs {
+			if now.Sub(r.seen) >= f.window {
+				delete(addrs, a)
 
-			continue
+				continue
+			}
+
+			if h, err := netaddr.Host(a); err == nil {
+				set.Add(h)
+			}
 		}
 
-		if p, err := netaddr.ParseAllow(k.address); err == nil {
-			set.Add(p)
+		if len(addrs) == 0 {
+			delete(f.byUser, user)
 		}
 	}
 
 	return set
 }
 
-// due returns the fetchers to store: new ones, and ones last stored over
+// due returns the fetches to store: new ones, and ones last stored over
 // storeEvery before they were last seen.
-func (f *fetchers) due() (keys []fetcherKey, rows [][]any) {
+func (f *fetchers) due() []fetchRow {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	for k, t := range f.seen {
-		if last, ok := f.stored[k]; ok && t.Sub(last) < storeEvery {
-			continue
-		}
+	var out []fetchRow
 
-		keys = append(keys, k)
-		rows = append(rows, []any{t, k.user, k.address})
+	for user, addrs := range f.byUser {
+		for a, r := range addrs {
+			if !r.stored.IsZero() && r.seen.Sub(r.stored) < storeEvery {
+				continue
+			}
+
+			out = append(out, fetchRow{user: user, address: a, at: r.seen})
+		}
 	}
 
-	return keys, rows
+	return out
 }
 
-func (f *fetchers) markStored(keys []fetcherKey, rows [][]any) {
+func (f *fetchers) markStored(rows []fetchRow) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	for i, k := range keys {
-		if t, ok := rows[i][0].(time.Time); ok {
-			f.stored[k] = t
+	for _, row := range rows {
+		if r := f.byUser[row.user][row.address]; r != nil && row.at.After(r.stored) {
+			r.stored = row.at
 		}
 	}
 }
 
 // restore loads a stored fetch. Users the configuration no longer names are
-// skipped, so narrowing users takes effect for stored addresses too.
+// skipped, so narrowing users takes effect for stored addresses too, and so
+// is anything stored that is not one address.
 func (f *fetchers) restore(user, address string, at time.Time) {
-	if !f.users.MatchString(user) {
-		return
-	}
+	if r := f.put(user, address, at); r != nil {
+		f.mu.Lock()
+		defer f.mu.Unlock()
 
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	k := fetcherKey{user: user, address: address}
-	if at.After(f.seen[k]) {
-		f.put(k, at)
-		f.stored[k] = at
+		if at.After(r.stored) {
+			r.stored = at
+		}
 	}
 }
 
@@ -169,9 +199,14 @@ func (s *Scorer) storeFetchers(ctx context.Context) {
 		return
 	}
 
-	keys, rows := s.fetchers.due()
-	if len(rows) == 0 {
+	due := s.fetchers.due()
+	if len(due) == 0 {
 		return
+	}
+
+	rows := make([][]any, len(due))
+	for i, r := range due {
+		rows[i] = []any{r.at, r.user, r.address}
 	}
 
 	if err := s.src.Insert(ctx, s.cfg.Tables.Fetchers, []string{"Time", "User", "Address"}, rows); err != nil {
@@ -181,7 +216,7 @@ func (s *Scorer) storeFetchers(ctx context.Context) {
 		return
 	}
 
-	s.fetchers.markStored(keys, rows)
+	s.fetchers.markStored(due)
 }
 
 func (s *Scorer) restoreFetchers(ctx context.Context) error {

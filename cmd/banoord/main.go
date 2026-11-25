@@ -116,7 +116,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	reg := metrics.New()
 	sc := scorer.New(log, cfg, src, signer, reg, nil)
 
-	srvCfg := server.Config{Listen: o.listen, Version: version, FetchUserHeader: cfg.FetchUserHeader}
+	srvCfg := server.Config{Listen: o.listen, Version: version, FetchUserHeader: cfg.FetchUserHeader, TrustedProxies: cfg.TrustedProxies}
 	if cfg.Allow.Fetchers != nil {
 		srvCfg.FetchAddressHeader = cfg.Allow.Fetchers.AddressHeader
 	}

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"regexp"
 	"time"
@@ -74,9 +75,9 @@ type AllowQuery struct {
 }
 
 // Fetchers allowlists the addresses consumers fetch the list from: every
-// fetch whose user (fetchUserHeader) matches Users records the address in
-// AddressHeader, which the proxy in front must set and clients must not be
-// able to. Addresses seen within Window are allowed.
+// fetch through a trusted proxy whose user (fetchUserHeader) matches Users
+// records the address in AddressHeader, which that proxy must set and
+// clients must not be able to. Addresses seen within Window are allowed.
 type Fetchers struct {
 	AddressHeader string   `json:"addressHeader"`
 	Users         string   `json:"users"`
@@ -125,22 +126,26 @@ type Allow struct {
 
 // Config is the whole configuration.
 type Config struct {
-	FetchUserHeader string         `json:"fetchUserHeader"`
-	Interval        Duration       `json:"interval"`
-	Refresh         Duration       `json:"refresh"`
-	Source          Source         `json:"source"`
-	Tables          Tables         `json:"tables"`
-	Signing         Signing        `json:"signing"`
-	DefaultMode     string         `json:"defaultMode"`
-	Threshold       float64        `json:"threshold"`
-	Window          Duration       `json:"window"`
-	IPv6Prefix      int            `json:"ipv6Prefix"`
-	Ban             Ban            `json:"ban"`
-	Signals         []Signal       `json:"signals"`
-	Allow           Allow          `json:"allow"`
-	ManualFile      string         `json:"manualFile"`
-	Limits          netaddr.Limits `json:"limits"`
-	Caps            engine.Caps    `json:"caps"`
+	FetchUserHeader string `json:"fetchUserHeader"`
+	// TrustedProxies are the peers whose fetchUserHeader and
+	// allow.fetchers.addressHeader are believed; without any, every peer's
+	// are, which allow.fetchers refuses.
+	TrustedProxies []netip.Prefix `json:"trustedProxies"`
+	Interval       Duration       `json:"interval"`
+	Refresh        Duration       `json:"refresh"`
+	Source         Source         `json:"source"`
+	Tables         Tables         `json:"tables"`
+	Signing        Signing        `json:"signing"`
+	DefaultMode    string         `json:"defaultMode"`
+	Threshold      float64        `json:"threshold"`
+	Window         Duration       `json:"window"`
+	IPv6Prefix     int            `json:"ipv6Prefix"`
+	Ban            Ban            `json:"ban"`
+	Signals        []Signal       `json:"signals"`
+	Allow          Allow          `json:"allow"`
+	ManualFile     string         `json:"manualFile"`
+	Limits         netaddr.Limits `json:"limits"`
+	Caps           engine.Caps    `json:"caps"`
 }
 
 // Default returns the configuration every file starts from.
@@ -369,8 +374,8 @@ func (c *Config) validateAllow() error {
 	}
 
 	if f := c.Allow.Fetchers; f != nil {
-		if f.AddressHeader == "" || f.Window.Duration <= 0 || c.FetchUserHeader == "" {
-			errs = append(errs, errors.New("allow.fetchers needs an addressHeader, a window and fetchUserHeader"))
+		if f.AddressHeader == "" || f.Window.Duration <= 0 || c.FetchUserHeader == "" || len(c.TrustedProxies) == 0 {
+			errs = append(errs, errors.New("allow.fetchers needs an addressHeader, a window, fetchUserHeader and trustedProxies"))
 		}
 
 		switch re, err := regexp.Compile(f.Users); {

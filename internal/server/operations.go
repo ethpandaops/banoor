@@ -4,7 +4,9 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 
@@ -105,20 +107,42 @@ type fetcher struct {
 }
 
 // withFetcher puts who fetched, and from where, on the request context, from
-// the headers the proxy in front sets.
-func withFetcher(userHeader, addressHeader string, next http.Handler) http.Handler {
+// the headers a trusted proxy in front sets. An address header sent more
+// than once is ignored: a proxy that appends to it would leave the client's
+// own value first.
+func withFetcher(cfg Config, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var f fetcher
-		if userHeader != "" {
-			f.user = r.Header.Get(userHeader)
-		}
 
-		if addressHeader != "" {
-			f.address = r.Header.Get(addressHeader)
+		if trusted(cfg.TrustedProxies, r.RemoteAddr) {
+			if cfg.FetchUserHeader != "" {
+				f.user = r.Header.Get(cfg.FetchUserHeader)
+			}
+
+			if vs := r.Header.Values(cfg.FetchAddressHeader); cfg.FetchAddressHeader != "" && len(vs) == 1 {
+				f.address = vs[0]
+			}
 		}
 
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), fetcherKey{}, f)))
 	})
+}
+
+// trusted reports whether the peer at remoteAddr is one of proxies, or
+// proxies is empty.
+func trusted(proxies []netip.Prefix, remoteAddr string) bool {
+	if len(proxies) == 0 {
+		return true
+	}
+
+	ap, err := netip.ParseAddrPort(remoteAddr)
+	if err != nil {
+		return false
+	}
+
+	peer := ap.Addr().Unmap()
+
+	return slices.ContainsFunc(proxies, func(p netip.Prefix) bool { return p.Contains(peer) })
 }
 
 func fetcherFrom(ctx context.Context) fetcher {

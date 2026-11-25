@@ -1,5 +1,6 @@
 {
   "fetchUserHeader": "X-Forwarded-User",
+  "trustedProxies": ["192.0.2.10/32"],
   "interval": "30s",
   "refresh": "60s",
   "source": {
