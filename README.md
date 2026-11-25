@@ -36,17 +36,22 @@ To run it against ClickHouse:
    ```
 
 3. Put the ClickHouse password in `secrets/clickhouse-password`, and point
-   `source.dsn` in `etc/config.json` at your server.
-   `allow.fetchers` trusts the `X-Forwarded-User` and `X-Real-Ip` headers,
-   so serve banoord only behind a proxy that sets or strips both, or remove
-   it.
+   `source.dsn` in `etc/config.json` at your server, by a name the container
+   can reach (`--network` for a server in another container).
+   `allow.fetchers` believes the `X-Forwarded-User` and `X-Real-Ip` headers
+   from `trustedProxies` alone: set that to the proxy in front, which must
+   set or strip both, or remove `allow.fetchers`.
 4. Run the image, as your own user so it can read the key, on loopback only:
 
    ```bash
    docker run --rm -p 127.0.0.1:8080:8080 --user "$(id -u):$(id -g)" \
      -v "$PWD/etc:/etc/banoor:ro" -v "$PWD/secrets:/run/secrets:ro" \
-     ghcr.io/ethpandaops/banoor:0.1.0
+     ghcr.io/ethpandaops/banoor:0.2.0
    ```
+
+   On Kubernetes the image runs as user 65532: set the pod's `fsGroup` so it
+   can read a secret mounted group-readable. The image holds `banoorctl` too
+   (`--entrypoint banoorctl`).
 
 `GET /api/v1/list` answers 503 until the first run succeeds;
 `/api/v1/health`, `/metrics` and `/openapi.yaml` answer at once.

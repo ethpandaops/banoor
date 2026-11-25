@@ -8,7 +8,8 @@ always match:
 ```
 
 - The response carries an `ETag`; a request whose `If-None-Match` names it
-  gets `304 Not Modified`.
+  gets `304 Not Modified`. A 304 is not signed, so it makes what you hold no
+  fresher: only a verified 200 resets its age.
 - `503` (an RFC 9457 problem) means no list has been published yet. Any
   answer other than `200` or `304` means: keep what you hold.
 
@@ -35,7 +36,7 @@ always match:
 | `previous_generation` | The generation this one replaces; 0 for the first. |
 | `generated_at` | When this payload was signed, in Unix seconds. An unchanged list is signed again every `refresh` (60 s by default) with the same generation. |
 | `mode` | `enforce`: apply the list in your own mode. `shadow`: load it, drop nothing. `empty`: `entries` is `[]`. |
-| `entries[].cidr` | A canonical prefix (host bits zero, IPv4 written as IPv4), no wider than the configured limits (/24 and /48 by default). Scored entries are single sources; wider ones come from the manual list. Sorted ascending. |
+| `entries[].cidr` | A canonical prefix (host bits zero, IPv4 written as IPv4), no wider than the configured limits (/24 and /48 by default). Scored entries are single sources; wider ones come from the manual list. Entries are sorted by this string, byte by byte, not by address: `198.51.100.10/32` comes before `198.51.100.9/32`. |
 | `entries[].expires` | Unix seconds. |
 | `entries[].source` | `scorer` or `manual`. |
 | `entries[].reason`, `entries[].commit` | For people, and possibly empty. Never parse them. |
@@ -45,7 +46,9 @@ No allow entries are ever published.
 ## Verifying a list
 
 The signature is OpenSSH's (`PROTOCOL.sshsig`, Ed25519, SHA-512) over the
-decoded payload bytes, in the namespace the server is configured with. Pin
+decoded payload bytes, in the namespace the server is configured with. It
+proves who made the list, not that it reached you: fetch over TLS, or a
+network you trust, so no one can withhold a newer one unnoticed for long. Pin
 the key in an `allowed_signers` file
 (`banoorctl pubkey -key FILE -principal list-signer -namespace example-banlist`
 prints the line), then:
@@ -68,7 +71,8 @@ ssh-keygen -Y verify -f allowed_signers -I list-signer -n example-banlist -s pay
 4. Your own limits before loading: the widest prefix, the number of entries,
    total coverage, and how many entries a list adds when your loaded
    generation equals `previous_generation`. Skip the last check on your first
-   load, and in `shadow` and `empty` mode.
+   load, and in `shadow` and `empty` mode. A switch from `shadow` to
+   `enforce` adds no entries, so the whole list applies at once.
 5. Your own allowlist, which always wins.
 6. `mode`: drop nothing in `shadow`; flush in `empty`.
 
