@@ -118,6 +118,21 @@ const (
 	SourceManual = "manual"
 )
 
+// Suppression is a source or manual ban kept off the list.
+type Suppression struct {
+	Prefix netip.Prefix
+	Points float64
+	// By is SuppressedByAllowlist or SuppressedByLift.
+	By     string
+	Manual bool
+}
+
+// What suppressed an entry.
+const (
+	SuppressedByAllowlist = "allowlist"
+	SuppressedByLift      = "lift"
+)
+
 // Deferral reasons.
 const (
 	DeferHourCap       = "hour_cap"
@@ -138,7 +153,7 @@ type Result struct {
 	Entries   []Entry
 	// Suppressed are sources over the threshold, and manual bans, that the
 	// allowlist or a lift keeps off the list.
-	Suppressed []netip.Prefix
+	Suppressed []Suppression
 	// Deferred are entries a cap holds back, by reason. They are considered
 	// again at the next step.
 	Deferred map[string][]netip.Prefix
@@ -250,6 +265,14 @@ func (e *Engine) Step(in Inputs) Result {
 	res.Entries, listed = e.admit(in.Mode, in.Now, e.items(in.Now, v, cands), &res)
 	e.wouldBan(in.Now, scores, shadow, v, listed, &res)
 
+	slices.SortFunc(res.Suppressed, func(a, b Suppression) int {
+		if d := a.Prefix.Compare(b.Prefix); d != 0 {
+			return d
+		}
+
+		return strings.Compare(a.By, b.By)
+	})
+
 	return res
 }
 
@@ -354,6 +377,15 @@ type view struct {
 
 func (v view) blocked(p netip.Prefix) bool { return v.allow.Overlaps(p) || v.lifts.Overlaps(p) }
 
+// by names what blocks p: the allowlist wins over a lift.
+func (v view) by(p netip.Prefix) string {
+	if v.allow.Overlaps(p) {
+		return SuppressedByAllowlist
+	}
+
+	return SuppressedByLift
+}
+
 // manualView sorts the manual entries in force into lifts and the bans that
 // no lift or allowlist entry overlaps.
 func (e *Engine) manualView(in Inputs, res *Result) view {
@@ -384,7 +416,7 @@ func (e *Engine) manualView(in Inputs, res *Result) view {
 		}
 
 		if v.blocked(m.Prefix) {
-			res.Suppressed = append(res.Suppressed, m.Prefix)
+			res.Suppressed = append(res.Suppressed, Suppression{Prefix: m.Prefix, By: v.by(m.Prefix), Manual: true})
 
 			continue
 		}
@@ -406,7 +438,7 @@ func (e *Engine) candidates(now time.Time, scores map[netip.Prefix]*candidate, v
 		}
 
 		if v.blocked(c.unit) {
-			res.Suppressed = append(res.Suppressed, c.unit)
+			res.Suppressed = append(res.Suppressed, Suppression{Prefix: c.unit, Points: c.points, By: v.by(c.unit)})
 
 			continue
 		}

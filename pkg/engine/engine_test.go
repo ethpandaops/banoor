@@ -62,6 +62,17 @@ func strs(ps []netip.Prefix) []string {
 	return out
 }
 
+func suppressed(r Result) []string {
+	out := make([]string, 0, len(r.Suppressed))
+	for _, s := range r.Suppressed {
+		out = append(out, s.Prefix.String()+" "+s.By)
+	}
+
+	slices.Sort(out)
+
+	return out
+}
+
 func banned(r Result) []string {
 	out := make([]string, 0, len(r.NewBans))
 	for _, b := range r.NewBans {
@@ -201,7 +212,7 @@ func TestAllowlistAndLiftsWin(t *testing.T) {
 		t.Fatalf("entries = %v", got)
 	}
 
-	if got := strs(r.Suppressed); !slices.Equal(got, []string{"198.51.100.5/32", "2001:db8:1:2::/64"}) {
+	if got := suppressed(r); !slices.Equal(got, []string{"198.51.100.5/32 allowlist", "2001:db8:1:2::/64 allowlist"}) {
 		t.Errorf("suppressed = %v", got)
 	}
 
@@ -246,8 +257,24 @@ func TestBlockedManualBanHidesNothing(t *testing.T) {
 		t.Fatalf("entries = %v", got)
 	}
 
-	if got := strs(r.Suppressed); !slices.Equal(got, []string{"198.51.100.0/24", "203.0.113.0/24"}) {
+	if got := suppressed(r); !slices.Equal(got, []string{"198.51.100.0/24 lift", "203.0.113.0/24 allowlist"}) {
 		t.Errorf("suppressed = %v", got)
+	}
+}
+
+func TestSuppressedComeOutInOrder(t *testing.T) {
+	t.Parallel()
+
+	var in []Row
+	for i := range 20 {
+		in = append(in, Row{fmt.Sprintf("198.51.100.%d", 20-i), "h", 60})
+	}
+
+	e := New(testConfig())
+	r := e.Step(Inputs{Now: t0, Mode: Enforce, Allow: netaddr.NewSet(netip.MustParsePrefix("198.51.100.0/24")), Rows: invalid(in...)})
+
+	if len(r.Suppressed) != 20 || !slices.IsSortedFunc(r.Suppressed, func(a, b Suppression) int { return a.Prefix.Compare(b.Prefix) }) {
+		t.Errorf("suppressed = %v", r.Suppressed)
 	}
 }
 
