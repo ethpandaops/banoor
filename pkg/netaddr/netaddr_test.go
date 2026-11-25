@@ -3,6 +3,7 @@ package netaddr
 import (
 	"math"
 	"net/netip"
+	"slices"
 	"testing"
 )
 
@@ -73,6 +74,7 @@ func TestParseAllow(t *testing.T) {
 		"10.1.2.3/8":           "10.0.0.0/8",
 		"::ffff:192.0.2.0/120": "192.0.2.0/24",
 		"fe80::1%eth0":         "fe80::1/128",
+		"128.0.0.0/1":          "128.0.0.0/1",
 	} {
 		got, err := ParseAllow(in)
 		if err != nil {
@@ -82,6 +84,80 @@ func TestParseAllow(t *testing.T) {
 		if got.String() != want {
 			t.Errorf("ParseAllow(%q) = %s, want %s", in, got, want)
 		}
+	}
+
+	for _, bad := range []string{"0.0.0.0/0", "::/0", "::ffff:0.0.0.0/96", "::ffff:0:0/95", "192.0.2.0/33"} {
+		if p, err := ParseAllow(bad); err == nil {
+			t.Errorf("ParseAllow(%q) = %s, want an error", bad, p)
+		}
+	}
+}
+
+// The index must answer exactly what checking every prefix answers, for
+// every set drawn from prefixes that nest and border each other.
+func TestSetMatchesAScan(t *testing.T) {
+	t.Parallel()
+
+	var universe []netip.Prefix
+	for _, c := range []string{
+		"198.51.100.0/29", "198.51.100.0/30", "198.51.100.0/31", "198.51.100.2/31",
+		"198.51.100.0/32", "198.51.100.1/32", "198.51.100.2/32", "198.51.100.3/32",
+		"2001:db8::/127", "2001:db8::/128", "2001:db8::1/128",
+	} {
+		universe = append(universe, netip.MustParsePrefix(c))
+	}
+
+	queries := slices.Clone(universe)
+	for _, c := range []string{"198.51.100.4/30", "198.51.100.4/32", "198.51.100.0/24", "2001:db8::/64", "2001:db8::2/127"} {
+		queries = append(queries, netip.MustParsePrefix(c))
+	}
+
+	for mask := range 1 << len(universe) {
+		var ps []netip.Prefix
+		for i, q := range universe {
+			if mask&(1<<i) != 0 {
+				ps = append(ps, q)
+			}
+		}
+
+		s := NewSet(ps...)
+
+		for _, p := range queries {
+			overlaps, covers := scan(ps, p)
+			if got := s.Overlaps(p); got != overlaps {
+				t.Fatalf("%v: Overlaps(%s) = %v, want %v", ps, p, got, overlaps)
+			}
+
+			if got := s.Covers(p); got != covers {
+				t.Fatalf("%v: Covers(%s) = %v, want %v", ps, p, got, covers)
+			}
+		}
+	}
+}
+
+func scan(ps []netip.Prefix, p netip.Prefix) (overlaps, covers bool) {
+	for _, q := range ps {
+		overlaps = overlaps || q.Overlaps(p)
+		covers = covers || (q.Bits() <= p.Bits() && q.Contains(p.Addr()))
+	}
+
+	return overlaps, covers
+}
+
+func TestSetAddAfterALookup(t *testing.T) {
+	t.Parallel()
+
+	s := NewSet(netip.MustParsePrefix("198.51.100.0/24"))
+	p := netip.MustParsePrefix("203.0.113.7/32")
+
+	if s.Overlaps(p) {
+		t.Fatal("overlaps before the add")
+	}
+
+	s.Add(netip.MustParsePrefix("203.0.113.0/28"))
+
+	if !s.Overlaps(p) || !s.Covers(p) {
+		t.Error("a lookup's index hides a later add")
 	}
 }
 
@@ -146,7 +222,7 @@ func TestSpecialPurpose(t *testing.T) {
 	t.Parallel()
 
 	sp := SpecialPurpose()
-	for _, p := range []string{"10.1.2.3/32", "100.100.1.1/32", "198.18.0.1/32", "fd00::1/128", "fe80::/64", "64:ff9b::/64", "2001:0:1::/64"} {
+	for _, p := range []string{"10.1.2.3/32", "100.100.1.1/32", "198.18.0.1/32", "fd00::1/128", "fe80::/64", "64:ff9b::/64", "2001:0:1::/64", "::ff00:0:0/88"} {
 		if !sp.Overlaps(netip.MustParsePrefix(p)) {
 			t.Errorf("%s should be special-purpose", p)
 		}
