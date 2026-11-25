@@ -115,10 +115,11 @@ through its IPv6 /64 still makes one row per address. `cutIPv6(toIPv6(x), 8,
 0)` groups them into their /64 (the default `ipv6Prefix`) in the database
 and leaves IPv4 addresses whole.
 
-`weight` must be positive. A `shadow` signal never counts;
-`banoor_signal_would_ban_total` shows what it would have banned. A row whose
-`attempts` is NULL, NaN, infinite or negative counts as invalid, like an
-address that does not parse (`banoor_invalid_rows`). With
+A `shadow` signal never counts, whatever its weight;
+`banoor_signal_would_ban_total` shows what it would have banned. A weight of
+0 would give no points and no would-bans, so it is refused: leave such a
+signal out. A row whose `attempts` is NULL, NaN, infinite or negative counts
+as invalid, like an address that does not parse (`banoor_invalid_rows`). With
 `"parser": "openssh"` the query returns a `line` column instead of
 `address`, and only lines of the listed `kinds` count (`invalid_user`,
 `not_allowed`, `penalty_drop`, `maxstartups_drop`, `auth_closed`). That suits
@@ -126,8 +127,8 @@ small volumes; for large ones, aggregate in the database.
 
 `maxstartups_drop` hits whichever client sshd drops at random while it is
 over MaxStartups, not only the cause, and `penalty_drop` hits everyone in a
-penalised `PerSourceNetBlockSize` block: keep them in `shadow` unless that
-is what you want to count.
+penalised `PerSourceNetBlockSize` block, so counting them bans bystanders.
+Leave them out, or keep them in `shadow`, where they never count.
 
 ### Extracting SSH failures safely
 

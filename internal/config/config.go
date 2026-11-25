@@ -324,8 +324,15 @@ func validateSignal(s Signal) error {
 		errs = append(errs, fmt.Errorf("mode %q, want count or shadow", s.Mode))
 	}
 
-	if s.Weight <= 0 || s.Cap < 0 {
-		errs = append(errs, errors.New("weight must be positive and cap cannot be negative"))
+	switch {
+	case s.Weight == 0:
+		errs = append(errs, errors.New("weight 0 gives no points and, in shadow mode, no would-bans: leave the signal out"))
+	case s.Weight < 0:
+		errs = append(errs, errors.New("weight cannot be negative"))
+	}
+
+	if s.Cap < 0 {
+		errs = append(errs, errors.New("cap cannot be negative"))
 	}
 
 	switch s.Parser {
