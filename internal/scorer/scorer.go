@@ -5,7 +5,7 @@ package scorer
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"log/slog"
 	"sync/atomic"
 	"time"
@@ -40,6 +40,8 @@ type allowRow struct {
 type allowCache struct {
 	rows   []allowRow
 	loaded time.Time
+	// keys is the last good key list, kept when its file breaks.
+	keys map[string]bool
 }
 
 // Scorer is one scoring loop.
@@ -118,8 +120,10 @@ func (s *Scorer) Run(ctx context.Context) {
 
 	for {
 		runCtx, cancel := context.WithTimeout(ctx, s.cfg.Interval.Duration)
-		if err := s.RunOnce(runCtx); err != nil && ctx.Err() == nil {
-			s.log.WarnContext(ctx, "run published nothing", "error", err)
+
+		var b *blockedError
+		if err := s.RunOnce(runCtx); errors.As(err, &b) && ctx.Err() == nil {
+			s.log.WarnContext(ctx, "run published nothing", "reason", b.reason, "error", b.err)
 		}
 
 		cancel()
@@ -132,15 +136,29 @@ func (s *Scorer) Run(ctx context.Context) {
 	}
 }
 
+// blockedError is why a run published nothing.
+type blockedError struct {
+	reason string
+	err    error
+}
+
+func (e *blockedError) Error() string { return e.reason + ": " + e.err.Error() }
+
+func (e *blockedError) Unwrap() error { return e.err }
+
 func (s *Scorer) blocked(reason string, err error) error {
 	s.metrics.Add("banoor_run_blocked_total", 1, "reason", reason)
 
-	return fmt.Errorf("%s: %w", reason, err)
+	return &blockedError{reason: reason, err: err}
 }
 
 // RunOnce reads every input, scores, records new decisions and publishes.
-// A run that cannot read an input or record what it decided publishes
-// nothing, so the served list ages and consumers keep what they hold.
+// A missing input may only keep sources off the list: a signal that cannot
+// be read is left out, and decisions that cannot be recorded are not made,
+// so the kill switch, lifts and expiries still take effect. A run that
+// cannot read the mode, the allowlists or the manual list, or record a new
+// generation, publishes nothing, so the served list ages and consumers keep
+// what they hold.
 func (s *Scorer) RunOnce(ctx context.Context) error {
 	start := s.now()
 	now := start.UTC()
@@ -149,6 +167,10 @@ func (s *Scorer) RunOnce(ctx context.Context) error {
 		if err := s.restore(ctx, now); err != nil {
 			return s.blocked("restore", err)
 		}
+	}
+
+	if err := s.readMode(ctx); err != nil {
+		return s.blocked("control", err)
 	}
 
 	in, err := s.inputs(ctx, now)
@@ -160,7 +182,10 @@ func (s *Scorer) RunOnce(ctx context.Context) error {
 	pub := s.pub.Load()
 
 	if err = s.recordDecisions(ctx, res, pub.Next(now)); err != nil {
-		return s.blocked("record", err)
+		s.log.WarnContext(ctx, "could not record new decisions; publishing without them", "error", err)
+
+		in.NoNewDecisions = true
+		res = s.engine.Step(in)
 	}
 
 	s.engine.Commit(res)
@@ -192,18 +217,17 @@ func (s *Scorer) RunOnce(ctx context.Context) error {
 	return nil
 }
 
-// inputs reads everything a step needs. Each read that fails blocks the run.
+// inputs reads everything a step needs. An empty list needs nothing, so the
+// kill switch works whatever else fails. A signal that cannot be read is left
+// out; any other read that fails blocks the run.
 func (s *Scorer) inputs(ctx context.Context, now time.Time) (engine.Inputs, error) {
-	if err := s.readMode(ctx); err != nil {
-		return engine.Inputs{}, s.blocked("control", err)
+	if s.mode == engine.Empty {
+		return engine.Inputs{Now: now, Mode: engine.Empty}, nil
 	}
 
-	rows, err := s.readSignals(ctx)
-	if err != nil {
-		return engine.Inputs{}, s.blocked("signals", err)
-	}
+	tallies := s.readSignals(ctx)
 
-	if err = s.readStatic(ctx); err != nil {
+	if err := s.readStatic(ctx); err != nil {
 		return engine.Inputs{}, s.blocked("allowlist", err)
 	}
 
@@ -225,10 +249,10 @@ func (s *Scorer) inputs(ctx context.Context, now time.Time) (engine.Inputs, erro
 	}
 
 	return engine.Inputs{
-		Now:    now,
-		Mode:   s.mode,
-		Rows:   rows,
-		Allow:  allow,
-		Manual: s.manual,
+		Now:     now,
+		Mode:    s.mode,
+		Tallies: tallies,
+		Allow:   allow,
+		Manual:  s.manual,
 	}, nil
 }

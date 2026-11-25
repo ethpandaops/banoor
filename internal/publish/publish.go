@@ -114,9 +114,10 @@ func (p *Publisher) Next(now time.Time) uint64 {
 }
 
 // Prepare signs mode and entries at now. It cuts a new generation when they
-// differ from the current list, and signs again when they do or when the
-// current signature is older than the refresh interval. It returns nil when
-// there is nothing to do. Nothing is served until Commit.
+// differ from the current list, and signs again when they do, when the
+// current signature is older than the refresh interval, or when it is from
+// the future, as after the clock steps back. It returns nil when there is
+// nothing to do. Nothing is served until Commit.
 func (p *Publisher) Prepare(now time.Time, mode engine.Mode, entries []engine.Entry) (*Prepared, error) {
 	p.mu.RLock()
 	cur, st := p.current, p.state
@@ -139,7 +140,7 @@ func (p *Publisher) Prepare(now time.Time, mode engine.Mode, entries []engine.En
 			started:    true,
 		}
 		pr.Change = newChange(st.entries, next)
-	case cur != nil && now.Sub(cur.GeneratedAt) < p.refresh:
+	case cur != nil && !now.Before(cur.GeneratedAt) && now.Sub(cur.GeneratedAt) < p.refresh:
 		return nil, nil //nolint:nilnil // nothing to publish is not an error
 	}
 

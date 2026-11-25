@@ -1,7 +1,9 @@
--- State tables banoor needs, and an example signal table. On a cluster, use
--- Replicated*MergeTree engines with Distributed tables in front, and set
--- source.insertSettings.distributed_foreground_insert to 1 so a recorded
--- decision is stored before the list that includes it is published.
+-- State tables banoor needs, and example signal and login tables. On a
+-- cluster, use Replicated*MergeTree engines with Distributed tables in front,
+-- and set source.insertSettings.distributed_foreground_insert to 1 so a
+-- recorded decision is stored before the list that includes it is published.
+-- Only banoord should write the state tables, and only operators the control
+-- table: banoord publishes what they hold.
 
 CREATE DATABASE IF NOT EXISTS banoor;
 
@@ -29,7 +31,8 @@ TTL toDateTime(Time) + INTERVAL 365 DAY DELETE WHERE Action NOT IN ('manual_ban'
 
 -- One row per published generation. banoor restores from the newest; past
 -- the TTL, a list that has not changed since is restored as unpublished, so
--- its entries count as additions for one generation.
+-- its entries count as additions and return caps.maxAddedPerGeneration at a
+-- time.
 CREATE TABLE IF NOT EXISTS banoor.publishes
 (
     Time               DateTime64(3),
@@ -50,7 +53,7 @@ ORDER BY Time
 TTL toDateTime(Time) + INTERVAL 90 DAY DELETE;
 
 -- Where consumers fetched the list from (allow.fetchers), so a restart
--- keeps them allowlisted.
+-- keeps them allowlisted. Keep the TTL longer than allow.fetchers.window.
 CREATE TABLE IF NOT EXISTS banoor.fetchers
 (
     Time    DateTime,
@@ -75,7 +78,8 @@ ORDER BY Time;
 
 -- An example signal source: refused SSH attempts per minute, source and
 -- reporting host, filled by whatever ships the logs (pkg/sshlog has the
--- patterns that extract them from raw sshd lines).
+-- patterns that extract them from raw sshd lines;
+-- docs/configuration.md shows a materialized view).
 CREATE TABLE IF NOT EXISTS banoor.ssh_failures
 (
     Minute   DateTime,
@@ -88,3 +92,15 @@ ENGINE = SummingMergeTree(Attempts)
 PARTITION BY toDate(Minute)
 ORDER BY (Minute, Feeder, Kind, Address)
 TTL Minute + INTERVAL 30 DAY DELETE;
+
+-- An example allow query source: public key logins per hour, address and key
+-- fingerprint, for allow.queries with a keysFile.
+CREATE TABLE IF NOT EXISTS banoor.ssh_logins
+(
+    Hour        DateTime,
+    Address     String,
+    Fingerprint String
+)
+ENGINE = ReplacingMergeTree
+ORDER BY (Hour, Address, Fingerprint)
+TTL Hour + INTERVAL 35 DAY DELETE;

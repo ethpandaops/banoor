@@ -51,9 +51,10 @@ make build          # build/bin/banoord and build/bin/banoorctl
   ([docs/list-format.md](docs/list-format.md)): never rename them.
 - Every operation's `default` response is the RFC 9457 `Problem`.
 - `/metrics` is hand-routed beside the spec.
-- The spec has no linter in CI: ogen rejects what it cannot generate, and
-  `Payload` and `Entry` are deliberately unreferenced, since they document
-  what `Envelope.payload` decodes to.
+- The spec has no linter in CI: ogen rejects what it cannot generate.
+  `Envelope.payload` names `Payload` as its `contentSchema`, and
+  `TestPayloadMatchesTheSpec` fails when the signed payload's fields and the
+  spec's `Payload` and `Entry` differ.
 
 ## Go
 

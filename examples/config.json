@@ -1,5 +1,6 @@
 {
   "fetchUserHeader": "X-Forwarded-User",
+  "trustedProxies": ["192.0.2.10/32"],
   "interval": "30s",
   "refresh": "60s",
   "source": {
@@ -35,19 +36,19 @@
       "name": "invalid_user",
       "mode": "count",
       "weight": 1,
-      "query": "SELECT Address AS address, Feeder AS feeder, sum(Attempts) AS attempts FROM banoor.ssh_failures WHERE Kind = 'invalid_user' AND Minute >= now() - toIntervalSecond({window:UInt32}) GROUP BY address, feeder"
+      "query": "SELECT cutIPv6(toIPv6(Address), 8, 0) AS address, Feeder AS feeder, sum(Attempts) AS attempts FROM banoor.ssh_failures WHERE Kind = 'invalid_user' AND Minute >= now() - toIntervalSecond({window:UInt32}) GROUP BY address, feeder"
     },
     {
       "name": "not_allowed",
       "mode": "count",
       "weight": 1,
-      "query": "SELECT Address AS address, Feeder AS feeder, sum(Attempts) AS attempts FROM banoor.ssh_failures WHERE Kind = 'not_allowed' AND Minute >= now() - toIntervalSecond({window:UInt32}) GROUP BY address, feeder"
+      "query": "SELECT cutIPv6(toIPv6(Address), 8, 0) AS address, Feeder AS feeder, sum(Attempts) AS attempts FROM banoor.ssh_failures WHERE Kind = 'not_allowed' AND Minute >= now() - toIntervalSecond({window:UInt32}) GROUP BY address, feeder"
     },
     {
       "name": "penalty_drop",
       "mode": "shadow",
-      "weight": 0,
-      "query": "SELECT Address AS address, Feeder AS feeder, sum(Attempts) AS attempts FROM banoor.ssh_failures WHERE Kind = 'penalty_drop' AND Minute >= now() - toIntervalSecond({window:UInt32}) GROUP BY address, feeder"
+      "weight": 1,
+      "query": "SELECT cutIPv6(toIPv6(Address), 8, 0) AS address, Feeder AS feeder, sum(Attempts) AS attempts FROM banoor.ssh_failures WHERE Kind = 'penalty_drop' AND Minute >= now() - toIntervalSecond({window:UInt32}) GROUP BY address, feeder"
     }
   ],
   "allow": {

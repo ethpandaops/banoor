@@ -75,6 +75,8 @@ func TestClickHouse(t *testing.T) {
 		t.Fatal("the generation was not recorded with its prefixes and its additions over the last published list")
 	}
 
+	// A row dated in the future does not pin the mode.
+	execSQL(t, ch, "INSERT INTO "+db+".control (Time, Mode, Reason) VALUES ('2099-01-01 00:00:00', 'enforce', 'integration test')")
 	execSQL(t, ch, "INSERT INTO "+db+".control (Mode, Reason) VALUES ('empty', 'integration test')")
 	runOnce(t, sc)
 

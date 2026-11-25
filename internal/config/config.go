@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/netip"
 	"os"
 	"regexp"
 	"time"
@@ -48,9 +50,6 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// MarshalJSON writes the duration as a string.
-func (d Duration) MarshalJSON() ([]byte, error) { return json.Marshal(d.String()) }
-
 // Signal is a query and how much its rows count. The query returns one row
 // per source and feeder with the columns address, feeder and attempts. With
 // a parser it returns line instead of address, and only lines of the listed
@@ -76,9 +75,9 @@ type AllowQuery struct {
 }
 
 // Fetchers allowlists the addresses consumers fetch the list from: every
-// fetch whose user (fetchUserHeader) matches Users records the address in
-// AddressHeader, which the proxy in front must set and clients must not be
-// able to. Addresses seen within Window are allowed.
+// fetch through a trusted proxy whose user (fetchUserHeader) matches Users
+// records the address in AddressHeader, which that proxy must set and
+// clients must not be able to. Addresses seen within Window are allowed.
 type Fetchers struct {
 	AddressHeader string   `json:"addressHeader"`
 	Users         string   `json:"users"`
@@ -125,34 +124,28 @@ type Allow struct {
 	Fetchers *Fetchers    `json:"fetchers"`
 }
 
-// Caps bound what one run may publish and ban.
-type Caps struct {
-	MaxEntries             int    `json:"maxEntries"`
-	MaxAddedPerGeneration  int    `json:"maxAddedPerGeneration"`
-	MaxNewPerHour          int    `json:"maxNewPerHour"`
-	MaxNewPerFeederPerHour int    `json:"maxNewPerFeederPerHour"`
-	MaxIPv4Addresses       uint64 `json:"maxIPv4Addresses"`
-	MaxIPv6Networks        uint64 `json:"maxIPv6Networks"`
-}
-
 // Config is the whole configuration.
 type Config struct {
-	FetchUserHeader string         `json:"fetchUserHeader"`
-	Interval        Duration       `json:"interval"`
-	Refresh         Duration       `json:"refresh"`
-	Source          Source         `json:"source"`
-	Tables          Tables         `json:"tables"`
-	Signing         Signing        `json:"signing"`
-	DefaultMode     string         `json:"defaultMode"`
-	Threshold       float64        `json:"threshold"`
-	Window          Duration       `json:"window"`
-	IPv6Prefix      int            `json:"ipv6Prefix"`
-	Ban             Ban            `json:"ban"`
-	Signals         []Signal       `json:"signals"`
-	Allow           Allow          `json:"allow"`
-	ManualFile      string         `json:"manualFile"`
-	Limits          netaddr.Limits `json:"limits"`
-	Caps            Caps           `json:"caps"`
+	FetchUserHeader string `json:"fetchUserHeader"`
+	// TrustedProxies are the peers whose fetchUserHeader and
+	// allow.fetchers.addressHeader are believed; without any, every peer's
+	// are, which allow.fetchers refuses.
+	TrustedProxies []netip.Prefix `json:"trustedProxies"`
+	Interval       Duration       `json:"interval"`
+	Refresh        Duration       `json:"refresh"`
+	Source         Source         `json:"source"`
+	Tables         Tables         `json:"tables"`
+	Signing        Signing        `json:"signing"`
+	DefaultMode    string         `json:"defaultMode"`
+	Threshold      float64        `json:"threshold"`
+	Window         Duration       `json:"window"`
+	IPv6Prefix     int            `json:"ipv6Prefix"`
+	Ban            Ban            `json:"ban"`
+	Signals        []Signal       `json:"signals"`
+	Allow          Allow          `json:"allow"`
+	ManualFile     string         `json:"manualFile"`
+	Limits         netaddr.Limits `json:"limits"`
+	Caps           engine.Caps    `json:"caps"`
 }
 
 // Default returns the configuration every file starts from.
@@ -171,7 +164,7 @@ func Default() Config {
 			RepeatWindow: Duration{30 * 24 * time.Hour},
 		},
 		Limits: netaddr.DefaultLimits,
-		Caps: Caps{
+		Caps: engine.Caps{
 			MaxEntries:             5000,
 			MaxAddedPerGeneration:  500,
 			MaxNewPerHour:          200,
@@ -196,6 +189,10 @@ func Load(path string) (*Config, error) {
 
 	if err = dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+
+	if err = dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("%s: data after the configuration", path)
 	}
 
 	if err = c.Validate(); err != nil {
@@ -275,6 +272,12 @@ func (c *Config) validatePolicy() error {
 		errs = append(errs, fmt.Errorf("ban: base must be positive and no longer than max; max and repeatWindow positive and at most %s", maxBan))
 	}
 
+	// Signals count over the window, so a ban that ended sooner would be
+	// issued again, and escalated, on the evidence of the first.
+	if c.Ban.Base.Duration < c.Window.Duration {
+		errs = append(errs, fmt.Errorf("ban.base %s must be at least the window, %s", c.Ban.Base.Duration, c.Window.Duration))
+	}
+
 	caps := c.Caps
 	if caps.MaxEntries <= 0 || caps.MaxAddedPerGeneration <= 0 || caps.MaxNewPerHour <= 0 || caps.MaxNewPerFeederPerHour <= 0 ||
 		caps.MaxIPv4Addresses == 0 || caps.MaxIPv6Networks == 0 {
@@ -321,8 +324,15 @@ func validateSignal(s Signal) error {
 		errs = append(errs, fmt.Errorf("mode %q, want count or shadow", s.Mode))
 	}
 
-	if s.Weight < 0 || s.Cap < 0 {
-		errs = append(errs, errors.New("weight and cap cannot be negative"))
+	switch {
+	case s.Weight == 0:
+		errs = append(errs, errors.New("weight 0 gives no points and, in shadow mode, no would-bans: leave the signal out"))
+	case s.Weight < 0:
+		errs = append(errs, errors.New("weight cannot be negative"))
+	}
+
+	if s.Cap < 0 {
+		errs = append(errs, errors.New("cap cannot be negative"))
 	}
 
 	switch s.Parser {
@@ -371,8 +381,8 @@ func (c *Config) validateAllow() error {
 	}
 
 	if f := c.Allow.Fetchers; f != nil {
-		if f.AddressHeader == "" || f.Window.Duration <= 0 || c.FetchUserHeader == "" {
-			errs = append(errs, errors.New("allow.fetchers needs an addressHeader, a window and fetchUserHeader"))
+		if f.AddressHeader == "" || f.Window.Duration <= 0 || c.FetchUserHeader == "" || len(c.TrustedProxies) == 0 {
+			errs = append(errs, errors.New("allow.fetchers needs an addressHeader, a window, fetchUserHeader and trustedProxies"))
 		}
 
 		switch re, err := regexp.Compile(f.Users); {
@@ -399,14 +409,7 @@ func (c *Config) Engine() engine.Config {
 		BanBase:      c.Ban.Base.Duration,
 		BanMax:       c.Ban.Max.Duration,
 		RepeatWindow: c.Ban.RepeatWindow.Duration,
-		Caps: engine.Caps{
-			MaxEntries:             c.Caps.MaxEntries,
-			MaxAddedPerGeneration:  c.Caps.MaxAddedPerGeneration,
-			MaxNewPerHour:          c.Caps.MaxNewPerHour,
-			MaxNewPerFeederPerHour: c.Caps.MaxNewPerFeederPerHour,
-			MaxIPv4Addresses:       c.Caps.MaxIPv4Addresses,
-			MaxIPv6Networks:        c.Caps.MaxIPv6Networks,
-		},
+		Caps:         c.Caps,
 	}
 
 	for _, s := range c.Signals {

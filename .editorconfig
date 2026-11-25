@@ -9,9 +9,13 @@ trim_trailing_whitespace = true
 [*.go]
 indent_style = tab
 
-[*.{ts,tsx,js,css,html,yaml,yml,md,json}]
+[*.{yaml,yml,md,json}]
 indent_style = space
 indent_size = 2
+
+[*.sql]
+indent_style = space
+indent_size = 4
 
 [Makefile]
 indent_style = tab

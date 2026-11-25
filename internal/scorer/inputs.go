@@ -10,8 +10,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/ethpandaops/banoor/internal/config"
 	"github.com/ethpandaops/banoor/internal/lists"
-
 	"github.com/ethpandaops/banoor/pkg/engine"
 	"github.com/ethpandaops/banoor/pkg/manual"
 	"github.com/ethpandaops/banoor/pkg/netaddr"
@@ -20,9 +20,11 @@ import (
 
 func seconds(d time.Duration) string { return strconv.FormatInt(int64(d/time.Second), 10) }
 
+// readMode reads the kill switch: the newest row of the control table that
+// is not dated in the future, where it would pin the mode.
 func (s *Scorer) readMode(ctx context.Context) error {
 	raw := s.cfg.DefaultMode
-	q := fmt.Sprintf("SELECT toString(Mode) AS mode FROM %s ORDER BY Time DESC LIMIT 1", s.cfg.Tables.Control)
+	q := fmt.Sprintf("SELECT toString(Mode) AS mode FROM %s WHERE Time <= now64(3) ORDER BY Time DESC LIMIT 1", s.cfg.Tables.Control)
 
 	err := s.src.Select(ctx, q, nil, func(row map[string]any) error {
 		raw = str(row["mode"])
@@ -46,46 +48,82 @@ func (s *Scorer) readMode(ctx context.Context) error {
 
 	s.mode, s.haveMode = m, true
 
+	for _, mode := range modes {
+		v := 0.0
+		if mode == m {
+			v = 1
+		}
+
+		s.metrics.Set("banoor_mode", v, "mode", string(mode))
+	}
+
 	return nil
 }
 
-func (s *Scorer) readSignals(ctx context.Context) (map[string][]engine.Row, error) {
-	out := map[string][]engine.Row{}
-	params := map[string]string{"window": seconds(s.cfg.Window.Duration)}
+// readSignals tallies every signal's rows. A signal whose query fails is
+// left out of the run, which can only mean fewer new bans.
+func (s *Scorer) readSignals(ctx context.Context) map[string]*engine.Tally {
+	out := map[string]*engine.Tally{}
 
 	for _, sig := range s.cfg.Signals {
-		err := s.src.Select(ctx, sig.Query, params, func(row map[string]any) error {
-			attempts, ok := num(row["attempts"])
-			switch {
-			case row["attempts"] == nil:
-				attempts = math.NaN() // NULL: the engine counts the row as invalid
-			case !ok:
-				return fmt.Errorf("attempts is %T, want a number", row["attempts"])
-			}
-
-			addr := str(row["address"])
-
-			if sig.Parser == "openssh" {
-				ev, parsed := sshlog.Parse(str(row["line"]))
-				if !parsed || !slices.Contains(sig.Kinds, string(ev.Kind)) {
-					return nil
-				}
-
-				addr = ev.Address.String()
-			}
-
-			out[sig.Name] = append(out[sig.Name], engine.Row{Address: addr, Feeder: str(row["feeder"]), Attempts: attempts})
-
-			return nil
-		})
+		t, err := s.readSignal(ctx, sig)
 		if err != nil {
 			s.metrics.Add("banoor_source_errors_total", 1, "query", "signal:"+sig.Name)
+			s.log.WarnContext(ctx, "scoring without a signal", "signal", sig.Name, "error", err)
 
-			return nil, fmt.Errorf("signal %s: %w", sig.Name, err)
+			continue
 		}
+
+		out[sig.Name] = t
 	}
 
-	return out, nil
+	return out
+}
+
+func (s *Scorer) readSignal(ctx context.Context, sig config.Signal) (*engine.Tally, error) {
+	t := s.engine.NewTally()
+	params := map[string]string{"window": seconds(s.cfg.Window.Duration)}
+
+	addressColumn := "address"
+	if sig.Parser == "openssh" {
+		addressColumn = "line"
+	}
+
+	err := s.src.Select(ctx, sig.Query, params, func(row map[string]any) error {
+		for _, c := range []string{addressColumn, "feeder", "attempts"} {
+			if _, ok := row[c]; !ok {
+				return fmt.Errorf("no %s column", c)
+			}
+		}
+
+		attempts, ok := num(row["attempts"])
+		switch {
+		case row["attempts"] == nil:
+			attempts = math.NaN() // NULL: the tally counts the row as invalid
+		case !ok:
+			return fmt.Errorf("attempts is %T, want an integer or a float", row["attempts"])
+		}
+
+		addr := str(row[addressColumn])
+
+		if sig.Parser == "openssh" {
+			ev, parsed := sshlog.Parse(addr)
+			if !parsed || !slices.Contains(sig.Kinds, string(ev.Kind)) {
+				return nil
+			}
+
+			addr = ev.Address.String()
+		}
+
+		t.Add(engine.Row{Address: addr, Feeder: str(row["feeder"]), Attempts: attempts})
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return t, nil
 }
 
 // readStatic rereads the allowlist files. A broken or missing file keeps the
@@ -112,7 +150,8 @@ func (s *Scorer) readStatic(ctx context.Context) error {
 
 // readAllowQueries refreshes the allow queries that are due and filters
 // every cached result by its key list, reread each run so a removed key
-// stops counting at once.
+// stops counting at once. A key list that cannot be read, or lists nothing,
+// keeps the last good one.
 func (s *Scorer) readAllowQueries(ctx context.Context, now time.Time) (*netaddr.Set, error) {
 	var errs []error
 
@@ -124,9 +163,11 @@ func (s *Scorer) readAllowQueries(ctx context.Context, now time.Time) (*netaddr.
 		if c == nil || now.Sub(c.loaded) >= q.Refresh.Duration {
 			rows, err := s.queryAllow(ctx, q.Query, q.Window.Duration)
 			switch {
-			case err == nil:
+			case err == nil && c == nil:
 				c = &allowCache{rows: rows, loaded: now}
 				s.dynamic[q.Name] = c
+			case err == nil:
+				c.rows, c.loaded = rows, now
 			case c == nil:
 				errs = append(errs, fmt.Errorf("allow query %s: %w", q.Name, err))
 
@@ -136,18 +177,47 @@ func (s *Scorer) readAllowQueries(ctx context.Context, now time.Time) (*netaddr.
 			}
 		}
 
-		set, err := filterAllow(c.rows, q.KeysFile)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("allow query %s: %w", q.Name, err))
+		if q.KeysFile != "" {
+			keys, err := readKeys(q.KeysFile)
+			switch {
+			case err == nil:
+				c.keys = keys
+			case c.keys == nil:
+				errs = append(errs, fmt.Errorf("allow query %s: %w", q.Name, err))
 
-			continue
+				continue
+			default:
+				s.metrics.Add("banoor_source_errors_total", 1, "query", "keys:"+q.Name)
+				s.log.WarnContext(ctx, "keeping the last good key list", "query", q.Name, "error", err)
+			}
 		}
 
+		set := filterAllow(c.rows, c.keys)
 		s.metrics.Set("banoor_allowlist_prefixes", float64(set.Len()), "list", q.Name)
 		out = netaddr.Union(out, set)
 	}
 
 	return out, errors.Join(errs...)
+}
+
+// readKeys reads a key list. One that lists no key is an error: it is more
+// likely truncated than meant to allow nobody.
+func readKeys(path string) (map[string]bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	keys, err := manual.ParseKeys(data)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("%s lists no keys", path)
+	}
+
+	return keys, nil
 }
 
 func (s *Scorer) queryAllow(ctx context.Context, query string, window time.Duration) ([]allowRow, error) {
@@ -167,20 +237,9 @@ func (s *Scorer) queryAllow(ctx context.Context, query string, window time.Durat
 	return rows, nil
 }
 
-func filterAllow(rows []allowRow, keysFile string) (*netaddr.Set, error) {
-	var keys map[string]bool
-
-	if keysFile != "" {
-		data, err := os.ReadFile(keysFile)
-		if err != nil {
-			return nil, fmt.Errorf("keys: %w", err)
-		}
-
-		if keys, err = manual.ParseKeys(data); err != nil {
-			return nil, err
-		}
-	}
-
+// filterAllow allows each row's address whose key is listed; with no key
+// list, every row's. A row allows one address, never a prefix.
+func filterAllow(rows []allowRow, keys map[string]bool) *netaddr.Set {
 	set := netaddr.NewSet()
 
 	for _, r := range rows {
@@ -188,12 +247,12 @@ func filterAllow(rows []allowRow, keysFile string) (*netaddr.Set, error) {
 			continue
 		}
 
-		if p, err := netaddr.ParseAllow(r.address); err == nil {
+		if p, err := netaddr.Host(r.address); err == nil {
 			set.Add(p)
 		}
 	}
 
-	return set, nil
+	return set
 }
 
 // readManual rereads the manual list. Invalid entries are skipped and
@@ -209,7 +268,7 @@ func (s *Scorer) readManual(ctx context.Context) error {
 	entries, errs, err := func() ([]manual.Entry, []error, error) {
 		data, readErr := os.ReadFile(s.cfg.ManualFile)
 		if readErr != nil {
-			return nil, nil, fmt.Errorf("manual list: %w", readErr)
+			return nil, nil, readErr
 		}
 
 		return manual.Parse(data, s.cfg.Limits)

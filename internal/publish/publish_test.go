@@ -3,9 +3,14 @@ package publish
 import (
 	"encoding/base64"
 	"encoding/json"
+	"maps"
+	"slices"
 	"testing"
 	"time"
 
+	"github.com/go-faster/yaml"
+
+	"github.com/ethpandaops/banoor/api"
 	"github.com/ethpandaops/banoor/pkg/engine"
 )
 
@@ -91,6 +96,37 @@ func TestPayloadFormat(t *testing.T) {
 	}
 }
 
+// The signed payload and its entries carry exactly the fields the spec's
+// Payload and Entry document.
+func TestPayloadMatchesTheSpec(t *testing.T) {
+	t.Parallel()
+
+	var spec struct {
+		Components struct {
+			Schemas map[string]struct {
+				Properties map[string]any `yaml:"properties"`
+			} `yaml:"schemas"`
+		} `yaml:"components"`
+	}
+	if err := yaml.Unmarshal(api.Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+
+	p := New(&fakeSigner{}, time.Minute, 0, nil)
+	publish(t, p, t0, engine.Enforce, entry("198.51.100.1/32"))
+
+	_, fields := decode(t, p.Current())
+	entries, _ := fields["entries"].([]any)
+	first, _ := entries[0].(map[string]any)
+
+	for name, got := range map[string]map[string]any{"Payload": fields, "Entry": first} {
+		want := slices.Sorted(maps.Keys(spec.Components.Schemas[name].Properties))
+		if keys := slices.Sorted(maps.Keys(got)); len(want) == 0 || !slices.Equal(keys, want) {
+			t.Errorf("%s fields = %v, the spec documents %v", name, keys, want)
+		}
+	}
+}
+
 func TestNothingIsServedBeforeCommit(t *testing.T) {
 	t.Parallel()
 
@@ -161,5 +197,16 @@ func TestGenerations(t *testing.T) {
 	// A mode change alone is a new generation.
 	if got := publish(t, p, later.Add(time.Second), engine.Shadow, entry("198.51.100.1/32"), entry("198.51.100.2/32")); got == nil || got.Generation != unixSeconds(later)+1 {
 		t.Fatalf("mode change = %+v", got)
+	}
+
+	// The clock steps back a minute: the list it signed is from the future,
+	// so it is signed again at once, in the same generation.
+	gen := p.Current().Generation
+	if got := publish(t, p, later.Add(-time.Minute), engine.Shadow, entry("198.51.100.1/32"), entry("198.51.100.2/32")); got != nil {
+		t.Fatalf("a clock step cut generation %+v", got)
+	}
+
+	if back, _ := decode(t, p.Current()); back.Generation != gen || back.GeneratedAt != later.Add(-time.Minute).Unix() {
+		t.Fatalf("after the clock stepped back: generation %d at %d", back.Generation, back.GeneratedAt)
 	}
 }

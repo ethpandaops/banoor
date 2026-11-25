@@ -100,7 +100,11 @@ components:
       properties:
         payload:
           type: string
-          description: Base64 (standard, padded) of the payload JSON bytes; see `Payload`.
+          description: Base64 (standard, padded) of the payload JSON bytes.
+          contentEncoding: base64
+          contentMediaType: application/json
+          contentSchema:
+            $ref: '#/components/schemas/Payload'
         signature:
           type: string
           description: >-
@@ -147,7 +151,9 @@ components:
       properties:
         cidr:
           type: string
-          description: A canonical prefix, sorted ascending in the list.
+          description: >-
+            A canonical prefix. The list is sorted by this string, byte by
+            byte, not by address.
           examples: ['198.51.100.10/32']
         expires:
           type: integer

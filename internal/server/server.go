@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"time"
 
 	"github.com/ogen-go/ogen/ogenerrors"
@@ -32,6 +33,9 @@ type Config struct {
 	// FetchAddressHeader names the request header holding the client's
 	// address, set by the proxy in front; empty records no addresses.
 	FetchAddressHeader string
+	// TrustedProxies are the peers whose fetch headers are believed; empty
+	// believes every peer.
+	TrustedProxies []netip.Prefix
 }
 
 // Lists is where the served list comes from.
@@ -81,7 +85,7 @@ func New(log *slog.Logger, cfg Config, lists Lists, metrics Metrics) (*Server, e
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/api/v1/", withFetcher(cfg.FetchUserHeader, cfg.FetchAddressHeader, generated))
+	mux.Handle("/api/v1/", withFetcher(cfg, generated))
 	mux.HandleFunc("GET /openapi.yaml", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/yaml")
 		_, _ = w.Write(api.Spec)

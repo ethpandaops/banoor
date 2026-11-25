@@ -2,14 +2,15 @@ package scorer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
-	"strings"
 	"time"
 
 	"github.com/ethpandaops/banoor/internal/publish"
 	"github.com/ethpandaops/banoor/pkg/engine"
 	"github.com/ethpandaops/banoor/pkg/manual"
+	"github.com/ethpandaops/banoor/pkg/netaddr"
 )
 
 const (
@@ -19,13 +20,18 @@ const (
 	actionSuppressed = "suppressed"
 )
 
+// manualActions maps a manual entry's action to the decision recording it.
+var manualActions = map[string]string{manual.Ban: actionManualBan, manual.Lift: actionManualLift}
+
 var decisionColumns = []string{"Time", "Generation", "Action", "Cidr", "Points", "Feeders", "Signals", "BanNumber", "Expires", "Mode", "Reason"}
 
 var publishColumns = []string{"Time", "Generation", "PreviousGeneration", "Mode", "Entries", "Added", "Removed", "Deferred", "PayloadSha256", "Cidrs"}
 
 // restore rebuilds the engine and the generation sequence from the state
 // tables: the bans within the longest window that matters, every manual
-// entry still in force, and the last published list.
+// entry still in force, and the last published list. A ban this
+// configuration could not have issued at now, such as a range or one dated
+// in the future, is skipped.
 func (s *Scorer) restore(ctx context.Context, now time.Time) error {
 	lookback := max(s.cfg.Ban.RepeatWindow.Duration, s.cfg.Ban.Max.Duration)
 	q := fmt.Sprintf(`SELECT toUnixTimestamp64Milli(Time) AS time_ms, Action AS action, Cidr AS cidr, Points AS points,
@@ -52,14 +58,22 @@ ORDER BY Time`, s.cfg.Tables.Decisions, actionBan, actionManualBan, actionManual
 
 		switch action := str(row["action"]); action {
 		case actionBan:
-			bans = append(bans, engine.Ban{
+			b := engine.Ban{
 				Unit: p, Issued: time.UnixMilli(integer(row["time_ms"])).UTC(), Expires: expires,
 				Points: float(row["points"]), Number: int(integer(row["ban_number"])), Reason: str(row["reason"]),
 				Feeders: strList(row["feeders"]),
-			})
-		case actionManualBan, actionManualLift:
-			e := manual.Entry{Action: strings.TrimPrefix(action, "manual_"), Prefix: p, Expires: expires}
-			manualKeys = append(manualKeys, e.Key())
+			}
+			if err = s.restorable(b, now); err != nil {
+				s.log.WarnContext(ctx, "skipping a recorded ban", "cidr", p.String(), "error", err)
+
+				return nil
+			}
+
+			bans = append(bans, b)
+		case actionManualBan:
+			manualKeys = append(manualKeys, manual.Entry{Action: manual.Ban, Prefix: p, Expires: expires}.Key())
+		case actionManualLift:
+			manualKeys = append(manualKeys, manual.Entry{Action: manual.Lift, Prefix: p, Expires: expires}.Key())
 		}
 
 		return nil
@@ -94,7 +108,25 @@ ORDER BY Time`, s.cfg.Tables.Decisions, actionBan, actionManualBan, actionManual
 
 	s.engine.Restore(bans, manualKeys, published)
 	s.pub.Store(publish.New(s.signer, s.cfg.Refresh.Duration, last, published))
-	s.log.InfoContext(ctx, "restored", "bans", len(bans), "manual", len(manualKeys), "last_generation", last, "at", now)
+	s.log.InfoContext(ctx, "restored", "bans", len(bans), "manual", len(manualKeys), "last_generation", last)
+
+	return nil
+}
+
+// restorable checks a recorded ban as the engine would have issued it: one
+// source, issued by now, for no longer than ban.max.
+func (s *Scorer) restorable(b engine.Ban, now time.Time) error {
+	if u, err := netaddr.Unit(b.Unit.Addr().String(), s.cfg.IPv6Prefix); err != nil || u != b.Unit {
+		return errors.New("not one source")
+	}
+
+	if b.Issued.After(now) {
+		return fmt.Errorf("issued in the future, at %s", b.Issued.Format(time.RFC3339))
+	}
+
+	if b.Expires.Sub(b.Issued) > s.cfg.Ban.Max.Duration {
+		return errors.New("lasts longer than ban.max")
+	}
 
 	return nil
 }
@@ -119,7 +151,7 @@ func (s *Scorer) recordDecisions(ctx context.Context, res engine.Result, generat
 		}
 
 		rows = append(rows, []any{
-			res.Now, generation, "manual_" + m.Action, m.Prefix.String(), 0.0, by,
+			res.Now, generation, manualActions[m.Action], m.Prefix.String(), 0.0, by,
 			map[string]float64{},
 			uint8(0), m.Expires.UTC(), mode, m.Reason,
 		})
@@ -170,7 +202,12 @@ func nonNil(s []string) []string {
 // logged and the source is reported again only when it is next suppressed
 // anew.
 func (s *Scorer) reportSuppressed(ctx context.Context, res engine.Result) {
-	fresh := s.episodes.observe("suppressed", suppressedKeys(res.Suppressed))
+	prefixes := make([]netip.Prefix, len(res.Suppressed))
+	for i, sup := range res.Suppressed {
+		prefixes[i] = sup.Prefix
+	}
+
+	fresh := s.episodes.observe("suppressed", strs(prefixes))
 	s.metrics.Add("banoor_suppressed_total", float64(len(fresh)))
 
 	if len(fresh) == 0 {

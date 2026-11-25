@@ -32,10 +32,11 @@ type fakeSource struct {
 	results   map[string][]map[string]any
 	inserted  map[string][][]any
 	failWrite map[string]bool
+	failQuery map[string]bool
 }
 
 func newFakeSource(results map[string][]map[string]any) *fakeSource {
-	return &fakeSource{results: results, inserted: map[string][][]any{}, failWrite: map[string]bool{}}
+	return &fakeSource{results: results, inserted: map[string][][]any{}, failWrite: map[string]bool{}, failQuery: map[string]bool{}}
 }
 
 func (f *fakeSource) Select(_ context.Context, query string, _ map[string]string, row func(map[string]any) error) error {
@@ -45,6 +46,8 @@ func (f *fakeSource) Select(_ context.Context, query string, _ map[string]string
 	var rows []map[string]any
 
 	switch {
+	case f.failQuery[query]:
+		return errors.New("query refused")
 	case strings.Contains(query, "FROM state.control"):
 		if f.mode != "" {
 			rows = []map[string]any{{"mode": f.mode}}
@@ -141,12 +144,13 @@ func (f *fakeSource) decisions(withSuppressed bool) []string {
 
 const testConfig = `{
 	"fetchUserHeader": "X-User",
+	"trustedProxies": ["192.0.2.10/32"],
 	"source": {"dsn": "clickhouse://test@127.0.0.1:9000"},
 	"tables": {"decisions": "state.decisions", "publishes": "state.publishes", "control": "state.control", "fetchers": "state.fetchers"},
 	"signing": {"keyFile": "unused", "namespace": "example-list"},
 	"signals": [
 		{"name": "invalid_user", "query": "SELECT counted", "weight": 1, "mode": "count"},
-		{"name": "drops", "query": "SELECT drops", "weight": 0, "mode": "count"},
+		{"name": "drops", "query": "SELECT drops", "weight": 1, "mode": "shadow"},
 		{"name": "raw", "query": "SELECT lines", "weight": 1, "mode": "count", "parser": "openssh", "kinds": ["invalid_user"]}
 	],
 	"allow": {
@@ -269,6 +273,9 @@ func testSource() *fakeSource {
 		"SELECT logins": {
 			{"address": "198.51.100.3", "key": "SHA256:listed"},
 			{"address": "198.51.100.4", "key": "SHA256:unknown"},
+			// A login comes from one address; a row naming a range allows
+			// nothing.
+			{"address": "198.51.100.0/24", "key": "SHA256:listed"},
 		},
 	})
 }
@@ -344,7 +351,7 @@ func TestScorerEndToEnd(t *testing.T) {
 	}
 }
 
-func TestFailedWritesPublishNothing(t *testing.T) {
+func TestFailedWrites(t *testing.T) {
 	t.Parallel()
 
 	_, key, _ := ed25519.GenerateKey(rand.Reader)
@@ -356,24 +363,33 @@ func TestFailedWritesPublishNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	before := h.sc.Current()
+	before := h.payload()
 
-	// A new ban cannot be recorded: the list is not re-signed, not even
-	// after the refresh interval, so it ages.
+	// A new ban and a lift arrive, but no decision can be recorded: the list
+	// is published with the lift and without the ban.
 	src.results["SELECT counted"] = append(src.results["SELECT counted"], row("198.51.100.9", "host-a", 99))
 	src.failWrite["state.decisions"] = true
+	h.writeManual(`{"entries": [{"action": "lift", "cidr": "198.51.100.1/32", "expires": "2030-01-08T00:00:00Z", "reason": "customer"}]}`)
 	h.clock = t0.Add(2 * time.Minute)
 
-	if err := h.run(); err == nil || h.sc.Current() != before {
-		t.Fatalf("a run whose decisions could not be recorded published (%v)", err)
+	if err := h.run(); err != nil {
+		t.Fatal(err)
 	}
 
-	// The ban is recorded but the new generation cannot be: still nothing.
+	got := cidrs(h.payload())
+	if slices.Contains(got, "198.51.100.9/32") || slices.Contains(got, "198.51.100.1/32") || len(got) != len(cidrs(before))-1 {
+		t.Fatalf("with decisions unrecordable: entries = %v, was %v", got, cidrs(before))
+	}
+
+	served := h.sc.Current()
+
+	// The ban is recorded but the new generation cannot be: nothing new is
+	// served.
 	src.failWrite["state.decisions"] = false
 	src.failWrite["state.publishes"] = true
 	h.clock = t0.Add(3 * time.Minute)
 
-	if err := h.run(); err == nil || h.sc.Current() != before {
+	if err := h.run(); err == nil || h.sc.Current() != served {
 		t.Fatalf("a generation that could not be recorded was served (%v)", err)
 	}
 
@@ -384,18 +400,111 @@ func TestFailedWritesPublishNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got := cidrs(h.payload()); !slices.Contains(got, "198.51.100.9/32") {
+	if got = cidrs(h.payload()); !slices.Contains(got, "198.51.100.9/32") {
 		t.Fatalf("after recovering: %v", got)
 	}
 
-	// Four bans at the start, then .9 once: recorded when its run failed to
-	// publish, and not again.
-	if n := len(src.decisions(false)); n != 5 {
-		t.Fatalf("decisions = %v, want 5", src.decisions(false))
+	// Four bans at the start, then .9 and the lift once: recorded when the
+	// generation could not be, and not again.
+	if n := len(src.decisions(false)); n != 6 {
+		t.Fatalf("decisions = %v, want 6", src.decisions(false))
 	}
 
-	if got := metricsText(t, h.reg); !strings.Contains(got, `banoor_run_blocked_total{reason="record"} 2`) {
-		t.Errorf("metrics lack two blocked records:\n%s", got)
+	if got := metricsText(t, h.reg); !strings.Contains(got, `banoor_run_blocked_total{reason="record"} 1`) {
+		t.Errorf("metrics lack one blocked record:\n%s", got)
+	}
+}
+
+func TestTheKillSwitchNeedsOnlyTheControlTable(t *testing.T) {
+	t.Parallel()
+
+	_, key, _ := ed25519.GenerateKey(rand.Reader)
+	src := testSource()
+	src.mode = "enforce"
+	h := newHarness(t, src, key, filepath.Join(t.TempDir(), "manual.json"))
+	h.writeManual(manualList)
+
+	if err := h.run(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Every signal, allowlist, key list and the manual list now fail, and so
+	// do decision inserts; a new loud source has arrived.
+	for _, q := range []string{"SELECT counted", "SELECT drops", "SELECT lines", "SELECT logins"} {
+		src.failQuery[q] = true
+	}
+
+	src.results["SELECT counted"] = append(src.results["SELECT counted"], row("198.51.100.9", "host-a", 99))
+	src.failWrite["state.decisions"] = true
+	h.writeManual(`{"entries": [`)
+
+	if err := os.RemoveAll(h.allowDir); err != nil {
+		t.Fatal(err)
+	}
+
+	src.mode = "empty"
+	h.clock = t0.Add(30 * time.Second)
+
+	if err := h.run(); err != nil {
+		t.Fatal(err)
+	}
+
+	if p := h.payload(); p.Mode != "empty" || len(p.Entries) != 0 {
+		t.Fatalf("after the kill switch: %+v", p)
+	}
+
+	if got := metricsText(t, h.reg); !strings.Contains(got, `banoor_mode{mode="empty"} 1`) {
+		t.Errorf("banoor_mode does not show the kill switch:\n%s", got)
+	}
+
+	// Restarted in the middle of it, with no last good input to fall back
+	// on, it still publishes the empty list.
+	h2 := newHarness(t, src, key, h.manual)
+	if err := os.RemoveAll(h2.allowDir); err != nil {
+		t.Fatal(err)
+	}
+
+	h2.clock = t0.Add(time.Minute)
+
+	if err := h2.run(); err != nil {
+		t.Fatal(err)
+	}
+
+	if p := h2.payload(); p.Mode != "empty" || len(p.Entries) != 0 {
+		t.Fatalf("after a restart in empty mode: %+v", p)
+	}
+}
+
+func TestAFailingSignalIsLeftOut(t *testing.T) {
+	t.Parallel()
+
+	_, key, _ := ed25519.GenerateKey(rand.Reader)
+	src := testSource()
+	h := newHarness(t, src, key, filepath.Join(t.TempDir(), "manual.json"))
+	h.writeManual(`{"entries": []}`)
+
+	// One signal's query fails and another lacks a column: the run scores
+	// without them.
+	src.failQuery["SELECT counted"] = true
+	src.results["SELECT lines"] = []map[string]any{{"line": "Invalid user x from 203.0.113.9 port 2", "attempts": float64(55)}}
+
+	if err := h.run(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := cidrs(h.payload()); len(got) != 0 {
+		t.Fatalf("entries = %v, want none", got)
+	}
+
+	got := metricsText(t, h.reg)
+	for _, want := range []string{`banoor_source_errors_total{query="signal:invalid_user"} 1`, `banoor_source_errors_total{query="signal:raw"} 1`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("metrics lack %s:\n%s", want, got)
+		}
+	}
+
+	if strings.Contains(got, "banoor_run_blocked_total{") {
+		t.Errorf("a failing signal blocked the run:\n%s", got)
 	}
 }
 
@@ -480,13 +589,34 @@ func TestBrokenAllowlistKeepsTheLastGood(t *testing.T) {
 		t.Fatalf("after losing the allowlist entries = %v, want .4 still allowed", got)
 	}
 
+	// A key list that goes missing, or is emptied, keeps the last good one:
+	// .3's login still allows it.
+	for i, broken := range []func() error{
+		func() error { return os.Remove(h.keys) },
+		func() error { return os.WriteFile(h.keys, []byte("# truncated\n"), 0o600) },
+	} {
+		if err := broken(); err != nil {
+			t.Fatal(err)
+		}
+
+		h.clock = t0.Add(time.Duration(2+i) * time.Minute)
+
+		if err := h.run(); err != nil {
+			t.Fatal(err)
+		}
+
+		if got := cidrs(h.payload()); slices.Contains(got, "198.51.100.3/32") {
+			t.Fatalf("after breaking the key list (%d) entries = %v, want .3 still allowed", i, got)
+		}
+	}
+
 	// The key list is reread every run: once its key is gone, .3's login
 	// no longer allows it.
 	if err := os.WriteFile(h.keys, []byte("SHA256:other\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	h.clock = t0.Add(2 * time.Minute)
+	h.clock = t0.Add(5 * time.Minute)
 
 	if err := h.run(); err != nil {
 		t.Fatal(err)
@@ -531,6 +661,36 @@ func TestRestartContinuesFromTheState(t *testing.T) {
 
 	if n := len(src.decisions(false)); n != decisions {
 		t.Fatalf("a restart recorded bans or manual entries again: %d decisions, want %d", n, decisions)
+	}
+}
+
+func TestRestoreSkipsBansItCouldNotHaveIssued(t *testing.T) {
+	t.Parallel()
+
+	_, key, _ := ed25519.GenerateKey(rand.Reader)
+	src := newFakeSource(map[string][]map[string]any{
+		"SELECT counted": nil, "SELECT drops": nil, "SELECT lines": nil, "SELECT logins": nil,
+	})
+	recorded := func(at time.Time, cidr string, d time.Duration) []any {
+		return []any{at, uint64(0), actionBan, cidr, 60.0, []string{"h"}, map[string]float64{}, uint8(1), at.Add(d), "enforce", "r"}
+	}
+	src.inserted["state.decisions"] = [][]any{
+		recorded(t0.Add(-time.Hour), "198.51.100.1/32", 24*time.Hour),
+		recorded(t0.Add(-time.Hour), "198.51.0.0/13", 24*time.Hour),
+		recorded(t0.Add(-time.Hour), "2001:db8:1::/48", 24*time.Hour),
+		recorded(t0.Add(-time.Hour), "198.51.100.2/32", 9000*time.Hour),
+		recorded(t0.Add(time.Hour), "198.51.100.3/32", 24*time.Hour),
+	}
+
+	h := newHarness(t, src, key, filepath.Join(t.TempDir(), "manual.json"))
+	h.writeManual(`{"entries": []}`)
+
+	if err := h.run(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := cidrs(h.payload()); !slices.Equal(got, []string{"198.51.100.1/32"}) {
+		t.Fatalf("entries = %v, want only the ban a scorer could have issued", got)
 	}
 }
 
@@ -630,5 +790,42 @@ func TestFetchersKeepTheNewestAddressesPerUser(t *testing.T) {
 
 	if got := cidrs(h.payload()); !slices.Contains(got, "198.51.100.4/32") || slices.Contains(got, "198.51.100.1/32") {
 		t.Fatalf("entries = %v, want .4 banned and .1 allowed", got)
+	}
+}
+
+func TestFetchersAreBounded(t *testing.T) {
+	t.Parallel()
+
+	_, key, _ := ed25519.GenerateKey(rand.Reader)
+	src := testSource()
+
+	// Stored rows that are not one address, or not a named user, are not
+	// restored.
+	src.inserted["state.fetchers"] = [][]any{
+		{t0, "host-a", "0.0.0.0/0"},
+		{t0, "host-a", "198.51.100.1, 198.51.100.4"},
+		{t0, "someone", "198.51.100.4"},
+	}
+
+	h := newHarness(t, src, key, filepath.Join(t.TempDir(), "manual.json"))
+	h.writeManual(`{"entries": []}`)
+
+	// Users past the bound are not recorded.
+	for i := range maxUsers {
+		h.sc.Seen(fmt.Sprintf("host-%d", i), fmt.Sprintf("2001:db8:%x::1", i))
+	}
+
+	h.sc.Seen("host-late", "198.51.100.1")
+
+	if err := h.run(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := cidrs(h.payload()); !slices.Contains(got, "198.51.100.1/32") || !slices.Contains(got, "198.51.100.4/32") {
+		t.Fatalf("entries = %v, want .1 and .4 banned", got)
+	}
+
+	if got := metricsText(t, h.reg); !strings.Contains(got, fmt.Sprintf(`banoor_allowlist_prefixes{list="fetchers"} %d`, maxUsers)) {
+		t.Errorf("metrics:\n%s", got)
 	}
 }

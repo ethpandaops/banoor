@@ -2,7 +2,6 @@
 package lists
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,7 +22,7 @@ func ReadAllowDir(dir string) (*netaddr.Set, error) {
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, fmt.Errorf("allowlist: %w", err)
+		return nil, err
 	}
 
 	for _, e := range entries {
@@ -35,7 +34,7 @@ func ReadAllowDir(dir string) (*netaddr.Set, error) {
 
 		info, statErr := os.Stat(path)
 		if statErr != nil {
-			return nil, fmt.Errorf("allowlist: %w", statErr)
+			return nil, statErr
 		}
 
 		if info.IsDir() {
@@ -44,12 +43,12 @@ func ReadAllowDir(dir string) (*netaddr.Set, error) {
 
 		data, readErr := os.ReadFile(path)
 		if readErr != nil {
-			return nil, fmt.Errorf("allowlist: %w", readErr)
+			return nil, readErr
 		}
 
 		list, parseErr := manual.ParseAllowList(path, data)
 		if parseErr != nil {
-			return nil, fmt.Errorf("allowlist: %w", parseErr)
+			return nil, parseErr
 		}
 
 		set = netaddr.Union(set, list)

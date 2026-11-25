@@ -7,6 +7,8 @@ import (
 	"mime"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -220,6 +222,58 @@ func TestGetList(t *testing.T) {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("metrics lack %q", want)
 		}
+	}
+}
+
+func TestFetchHeadersNeedATrustedProxy(t *testing.T) {
+	t.Parallel()
+
+	lists := &fakeLists{}
+	lists.set(listed)
+
+	reg := metrics.New()
+	cfg := Config{
+		FetchUserHeader: "X-Fetch-User", FetchAddressHeader: "X-Real-Ip",
+		TrustedProxies: []netip.Prefix{netip.MustParsePrefix("192.0.2.8/29"), netip.MustParsePrefix("2001:db8::/64")},
+	}
+
+	s, err := New(slog.New(slog.DiscardHandler), cfg, lists, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fetch := func(peer, user string, addresses ...string) {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/list", nil)
+		req.RemoteAddr = peer
+		req.Header.Set("X-Fetch-User", user)
+
+		for _, a := range addresses {
+			req.Header.Add("X-Real-Ip", a)
+		}
+
+		s.Handler().ServeHTTP(httptest.NewRecorder(), req)
+	}
+
+	fetch("192.0.2.9:4000", "host-a", "198.51.100.1")
+	fetch("[2001:db8::5]:4000", "host-b", "198.51.100.2")
+	fetch("[::ffff:192.0.2.10]:4000", "host-c", "198.51.100.3")
+	// A client reaching the port past the proxy, and one whose own header
+	// an appending proxy kept first, are not believed.
+	fetch("192.0.2.16:4000", "host-d", "198.51.100.4")
+	fetch("192.0.2.9:4000", "host-e", "198.51.100.5", "198.51.100.6")
+
+	want := []string{"host-a@198.51.100.1", "host-b@198.51.100.2", "host-c@198.51.100.3"}
+	if got := lists.seen; !slices.Equal(got, want) {
+		t.Errorf("fetches seen = %v, want %v", got, want)
+	}
+
+	var out strings.Builder
+	if err = reg.Write(&out); err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(out.String(), `banoor_fetches_total{user="unknown",result="ok"} 1`) {
+		t.Errorf("the untrusted peer's user header counted:\n%s", out.String())
 	}
 }
 

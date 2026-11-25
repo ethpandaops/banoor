@@ -41,6 +41,8 @@ func (r *Registry) Counter(name, help string) { r.define(name, "counter", help) 
 // Gauge defines a gauge.
 func (r *Registry) Gauge(name, help string) { r.define(name, "gauge", help) }
 
+var labelEscaper = strings.NewReplacer(`\`, `\\`, "\n", `\n`, `"`, `\"`)
+
 func labelString(labels []string) string {
 	if len(labels)%2 != 0 {
 		panic("metrics: labels must be name, value pairs")
@@ -56,8 +58,7 @@ func labelString(labels []string) string {
 		}
 		b.WriteString(labels[i])
 		b.WriteString(`="`)
-		v := strings.NewReplacer(`\`, `\\`, "\n", `\n`, `"`, `\"`).Replace(labels[i+1])
-		b.WriteString(v)
+		b.WriteString(labelEscaper.Replace(labels[i+1]))
 		b.WriteByte('"')
 	}
 	b.WriteByte('}')

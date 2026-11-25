@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net/netip"
+	"slices"
 	"strings"
 )
 
@@ -22,15 +23,22 @@ var DefaultLimits = Limits{IPv4MinPrefix: 24, IPv6MinPrefix: 48}
 // (IPv4-mapped IPv6 included) as a /32, and an IPv6 address as its network of
 // length ipv6Prefix.
 func Unit(addr string, ipv6Prefix int) (netip.Prefix, error) {
+	h, err := Host(addr)
+	if err != nil || h.Addr().Is4() {
+		return h, err
+	}
+	return h.Addr().Prefix(ipv6Prefix)
+}
+
+// Host parses one address as the prefix that holds only it, an IPv4-mapped
+// address as IPv4.
+func Host(addr string) (netip.Prefix, error) {
 	a, err := netip.ParseAddr(strings.TrimSpace(addr))
 	if err != nil {
 		return netip.Prefix{}, err
 	}
 	a = a.Unmap().WithZone("")
-	if a.Is4() {
-		return netip.PrefixFrom(a, 32), nil
-	}
-	return a.Prefix(ipv6Prefix)
+	return netip.PrefixFrom(a, a.BitLen()), nil
 }
 
 // ParseEntry parses a prefix for a published list. It must be canonical (host
@@ -56,28 +64,27 @@ func ParseEntry(s string, lim Limits) (netip.Prefix, error) {
 	return p, nil
 }
 
-// ParseAllow parses an allowlist line: an address, or a prefix of any width.
+// ParseAllow parses an allowlist line: an address, or a prefix of any width
+// short of /0, which would allow everything.
 func ParseAllow(s string) (netip.Prefix, error) {
 	s = strings.TrimSpace(s)
-	if strings.Contains(s, "/") {
-		p, err := netip.ParsePrefix(s)
-		if err != nil {
-			return netip.Prefix{}, err
-		}
-		if p.Addr().Is4In6() {
-			if p.Bits() < 96 {
-				return netip.Prefix{}, fmt.Errorf("%s: an IPv4-mapped prefix shorter than /96", s)
-			}
-			p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
-		}
-		return p.Masked(), nil
+	if !strings.Contains(s, "/") {
+		return Host(s)
 	}
-	a, err := netip.ParseAddr(s)
+	p, err := netip.ParsePrefix(s)
 	if err != nil {
 		return netip.Prefix{}, err
 	}
-	a = a.Unmap().WithZone("")
-	return netip.PrefixFrom(a, a.BitLen()), nil
+	if p.Addr().Is4In6() {
+		if p.Bits() < 96 {
+			return netip.Prefix{}, fmt.Errorf("%s: an IPv4-mapped prefix shorter than /96", s)
+		}
+		p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
+	}
+	if p.Bits() == 0 {
+		return netip.Prefix{}, fmt.Errorf("%s allows everything", s)
+	}
+	return p.Masked(), nil
 }
 
 // Coverage counts what a prefix covers: IPv4 addresses, or IPv6 /64
@@ -114,15 +121,31 @@ func Kind(p netip.Prefix, ipv6Prefix int) string {
 // benchmarking, multicast, reserved, and the IPv6 unspecified, loopback,
 // unique-local, link-local and multicast blocks. The NAT64 and Teredo
 // prefixes are here too: behind a translator or relay many clients share one
-// IPv6 network, so banning it would ban them all.
+// IPv6 network, so banning it would ban them all. So is the IPv4-mapped
+// block: a consumer that does not unmap addresses would apply a ban there to
+// IPv4 clients.
 var specialPurpose = []string{
 	"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
 	"172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4",
-	"::/128", "::1/128", "64:ff9b::/96", "64:ff9b:1::/48", "2001::/32", "fc00::/7", "fe80::/10", "ff00::/8",
+	"::/128", "::1/128", "::ffff:0:0/96", "64:ff9b::/96", "64:ff9b:1::/48", "2001::/32", "fc00::/7", "fe80::/10", "ff00::/8",
 }
 
-// Set is a list of prefixes. It stays small (an allowlist), so lookups scan.
-type Set struct{ prefixes []netip.Prefix }
+// Set is a set of prefixes, such as an allowlist. Lookups take time
+// logarithmic in its size; the index behind them is built by the first
+// lookup after a change, so a Set is not safe for concurrent use.
+type Set struct {
+	prefixes []netip.Prefix
+	idx      *index
+}
+
+// index finds the prefixes that hold a prefix by trying each length the set
+// has, and the ones inside it by searching their sorted first addresses.
+type index struct {
+	has    map[netip.Prefix]bool
+	lens4  [33]bool
+	lens6  [129]bool
+	starts []netip.Addr
+}
 
 // NewSet returns a set holding ps.
 func NewSet(ps ...netip.Prefix) *Set {
@@ -139,7 +162,10 @@ func SpecialPurpose() *Set {
 }
 
 // Add adds prefixes to the set.
-func (s *Set) Add(ps ...netip.Prefix) { s.prefixes = append(s.prefixes, ps...) }
+func (s *Set) Add(ps ...netip.Prefix) {
+	s.prefixes = append(s.prefixes, ps...)
+	s.idx = nil
+}
 
 // Union returns a new set with the prefixes of every set.
 func Union(sets ...*Set) *Set {
@@ -160,13 +186,38 @@ func (s *Set) Len() int {
 	return len(s.prefixes)
 }
 
+func (s *Set) index() *index {
+	if s.idx != nil {
+		return s.idx
+	}
+	x := &index{has: make(map[netip.Prefix]bool, len(s.prefixes))}
+	for _, p := range s.prefixes {
+		p = p.Masked()
+		x.has[p] = true
+		x.starts = append(x.starts, p.Addr())
+		if p.Addr().Is4() {
+			x.lens4[p.Bits()] = true
+		} else {
+			x.lens6[p.Bits()] = true
+		}
+	}
+	slices.SortFunc(x.starts, netip.Addr.Compare)
+	s.idx = x
+	return x
+}
+
 // Covers reports whether one prefix in the set holds all of p.
 func (s *Set) Covers(p netip.Prefix) bool {
-	if s == nil {
+	if s == nil || !p.IsValid() {
 		return false
 	}
-	for _, q := range s.prefixes {
-		if q.Bits() <= p.Bits() && q.Contains(p.Addr()) {
+	x := s.index()
+	lens := x.lens6[:]
+	if p.Addr().Is4() {
+		lens = x.lens4[:]
+	}
+	for bits := range p.Bits() + 1 {
+		if lens[bits] && x.has[netip.PrefixFrom(p.Addr(), bits).Masked()] {
 			return true
 		}
 	}
@@ -176,13 +227,13 @@ func (s *Set) Covers(p netip.Prefix) bool {
 // Overlaps reports whether p shares an address with any prefix in the set,
 // either way round: an allowed address inside a wider candidate counts.
 func (s *Set) Overlaps(p netip.Prefix) bool {
-	if s == nil {
+	if s == nil || !p.IsValid() {
 		return false
 	}
-	for _, q := range s.prefixes {
-		if q.Overlaps(p) {
-			return true
-		}
+	if s.Covers(p) {
+		return true
 	}
-	return false
+	addrs := s.index().starts
+	i, _ := slices.BinarySearchFunc(addrs, p.Masked().Addr(), netip.Addr.Compare)
+	return i < len(addrs) && p.Contains(addrs[i])
 }
