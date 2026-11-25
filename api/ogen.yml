@@ -1,0 +1,8 @@
+# ogen generates the server side only: routing, request decoding, response
+# encoding and validation. There is no Unimplemented stub, so a new operation
+# fails to compile until internal/server implements it.
+generator:
+  features:
+    disable_all: true
+    enable:
+      - paths/server

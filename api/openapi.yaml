@@ -1,0 +1,202 @@
+openapi: 3.1.0
+info:
+  title: banoor API
+  version: 0.1.0
+  license:
+    name: MIT
+    identifier: MIT
+  description: >-
+    This spec is the source of truth: the Go server (`api/rest`) is generated
+    from it. Prometheus metrics are served at `/metrics`, outside the spec.
+servers:
+  - url: /
+    description: Same-origin API server
+# No authentication. Serve it behind a proxy that authenticates consumers, or
+# on a private network.
+security: []
+tags:
+  - name: list
+    description: The signed ban list.
+  - name: system
+    description: Daemon health.
+paths:
+  /api/v1/list:
+    get:
+      operationId: getList
+      tags: [list]
+      summary: Fetch the signed ban list
+      description: >-
+        The current list as an envelope of the exact payload bytes and their
+        OpenSSH signature. The payload's format is `Payload`. An unchanged list
+        keeps its generation and is signed again every refresh interval with a
+        new `generated_at`, so its ETag changes then too.
+      parameters:
+        - name: If-None-Match
+          in: header
+          required: false
+          description: The ETag of a list the client holds; a match answers 304.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The current list.
+          headers:
+            ETag:
+              required: true
+              schema:
+                type: string
+            Cache-Control:
+              required: true
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        '304':
+          description: The client holds the current list.
+          headers:
+            ETag:
+              required: true
+              schema:
+                type: string
+            Cache-Control:
+              required: true
+              schema:
+                type: string
+        '503':
+          $ref: '#/components/responses/Problem'
+        default:
+          $ref: '#/components/responses/Problem'
+  /api/v1/health:
+    get:
+      operationId: getHealth
+      tags: [system]
+      summary: Report daemon health
+      description: >-
+        Answers while the daemon serves, whether or not its last run
+        succeeded: a failing source must not restart it.
+      responses:
+        '200':
+          description: The daemon is serving.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        default:
+          $ref: '#/components/responses/Problem'
+components:
+  responses:
+    Problem:
+      description: An error, as an RFC 9457 problem.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    Envelope:
+      type: object
+      required: [payload, signature]
+      properties:
+        payload:
+          type: string
+          description: Base64 (standard, padded) of the payload JSON bytes; see `Payload`.
+        signature:
+          type: string
+          description: >-
+            The armored OpenSSH signature (`-----BEGIN SSH SIGNATURE-----`)
+            over the decoded payload bytes, in the configured namespace.
+    Payload:
+      type: object
+      description: >-
+        The signed list, version 1. Not served as JSON: it is what
+        `Envelope.payload` decodes to. Consumers ignore fields they do not
+        know.
+      required: [version, generation, previous_generation, generated_at, mode, entries]
+      properties:
+        version:
+          type: integer
+          const: 1
+        generation:
+          type: integer
+          format: int64
+          description: >-
+            Only goes up; changes only when the entries or the mode change, or
+            the daemon restarts.
+        previous_generation:
+          type: integer
+          format: int64
+          description: The generation this one replaces; 0 for the first.
+        generated_at:
+          type: integer
+          format: int64
+          description: When this payload was signed, in Unix seconds.
+        mode:
+          type: string
+          enum: [enforce, shadow, empty]
+          description: >-
+            enforce: apply in the consumer's own mode. shadow: drop nothing.
+            empty: there are no entries.
+        entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/Entry'
+    Entry:
+      type: object
+      required: [cidr, expires, source]
+      properties:
+        cidr:
+          type: string
+          description: A canonical prefix, sorted ascending in the list.
+          examples: ['198.51.100.10/32']
+        expires:
+          type: integer
+          format: int64
+          description: Unix seconds.
+        source:
+          type: string
+          enum: [scorer, manual]
+        reason:
+          type: string
+          description: For people; never parse it.
+        commit:
+          type: string
+    Health:
+      type: object
+      required: [status, version, generation]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        version:
+          type: string
+          description: The build's version.
+          examples: ['0.1.0']
+        generation:
+          type: integer
+          format: int64
+          description: The served list's generation; 0 before the first.
+        lastSuccess:
+          type: string
+          format: date-time
+          description: When a run last succeeded, in UTC.
+    Problem:
+      type: object
+      description: RFC 9457 problem details.
+      required: [title, status]
+      properties:
+        type:
+          type: string
+          format: uri
+          default: about:blank
+        title:
+          type: string
+        status:
+          type: integer
+          minimum: 100
+          maximum: 599
+        detail:
+          type: string
+        instance:
+          type: string
+          format: uri
