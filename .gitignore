@@ -1,4 +1,14 @@
-/banoor
-/dist/
+# Build output
+/build/
+
+# Go
 *.test
 *.out
+go.work
+go.work.sum
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
