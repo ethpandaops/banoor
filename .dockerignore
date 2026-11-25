@@ -1,0 +1,9 @@
+# Send the builder only what the image is built from, so nothing else in the
+# checkout (keys, local configuration) reaches its context or cache.
+*
+!go.mod
+!go.sum
+!api/
+!cmd/
+!internal/
+!pkg/

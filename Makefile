@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help build run check lint generate generate-check vuln tidy-check fmt test clean
+.PHONY: help build image run check lint generate generate-check vuln tidy-check fmt test clean
 
 BIN_DIR ?= build/bin
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -17,6 +17,10 @@ help:
 build:
 	$(GO_BUILD) -o $(BIN_DIR)/banoord ./cmd/banoord
 	$(GO_BUILD) -o $(BIN_DIR)/banoorctl ./cmd/banoorctl
+
+## image: build the banoor:local container image
+image:
+	docker build -t banoor:local --build-arg VERSION=$(VERSION) .
 
 ## run: build and start banoord on LISTEN with CONFIG (see the README's quick start)
 run: build
