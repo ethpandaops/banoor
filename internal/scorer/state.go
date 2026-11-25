@@ -16,6 +16,7 @@ const (
 	actionBan        = "ban"
 	actionManualBan  = "manual_ban"
 	actionManualLift = "manual_lift"
+	actionSuppressed = "suppressed"
 )
 
 var decisionColumns = []string{"Time", "Generation", "Action", "Cidr", "Points", "Feeders", "Signals", "BanNumber", "Expires", "Mode", "Reason"}
@@ -161,4 +162,49 @@ func nonNil(s []string) []string {
 	}
 
 	return s
+}
+
+// reportSuppressed logs and records each source the allowlist or a lift
+// newly keeps off the list: in shadow mode, these are where the allowlist's
+// gaps and false positives show. Recording is best effort; a failure is
+// logged and the source is reported again only when it is next suppressed
+// anew.
+func (s *Scorer) reportSuppressed(ctx context.Context, res engine.Result) {
+	fresh := s.episodes.observe("suppressed", suppressedKeys(res.Suppressed))
+	s.metrics.Add("banoor_suppressed_total", float64(len(fresh)))
+
+	if len(fresh) == 0 {
+		return
+	}
+
+	isFresh := make(map[string]bool, len(fresh))
+	for _, k := range fresh {
+		isFresh[k] = true
+	}
+
+	rows := make([][]any, 0, len(fresh))
+
+	for _, sup := range res.Suppressed {
+		if !isFresh[sup.Prefix.String()] {
+			continue
+		}
+
+		reason := "by the " + sup.By
+		if sup.Manual {
+			reason = "manual ban kept off " + reason
+		}
+
+		s.log.InfoContext(ctx, "suppressed", "cidr", sup.Prefix.String(), "points", sup.Points, "by", sup.By, "manual", sup.Manual)
+		rows = append(rows, []any{
+			res.Now, uint64(0), actionSuppressed, sup.Prefix.String(), sup.Points,
+			[]string{},
+			map[string]float64{},
+			uint8(0), res.Now, string(s.mode), reason,
+		})
+	}
+
+	if err := s.src.Insert(ctx, s.cfg.Tables.Decisions, decisionColumns, rows); err != nil {
+		s.metrics.Add("banoor_source_errors_total", 1, "query", "decisions")
+		s.log.WarnContext(ctx, "could not record suppressed sources", "error", err)
+	}
 }

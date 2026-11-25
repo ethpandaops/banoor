@@ -64,9 +64,10 @@ func TestClickHouse(t *testing.T) {
 		t.Fatalf("generation %d follows %d, want 4000000001 after the highest recorded", first.Generation, first.PreviousGeneration)
 	}
 
-	// Two bans, but not the manual ban again; one generation, with its
-	// prefixes, adding two to what consumers held; one fetcher.
-	if d, f := countRows(t, ch, db+".decisions"), countRows(t, ch, db+".fetchers"); d != 3 || f != 1 {
+	// Two bans and .5's suppression, but not the manual ban again; one
+	// generation, with its prefixes, adding two to what consumers held; one
+	// fetcher.
+	if d, f := countRows(t, ch, db+".decisions"), countRows(t, ch, db+".fetchers"); d != 4 || f != 1 {
 		t.Fatalf("decisions %d, fetchers %d", d, f)
 	}
 
@@ -92,7 +93,7 @@ func TestClickHouse(t *testing.T) {
 		t.Fatalf("after a restart: %+v, previous %d, want to follow %d", after, after.PreviousGeneration, empty.Generation)
 	}
 
-	if d := countRows(t, ch, db+".decisions"); d != 3 {
+	if d := countRows(t, ch, db+".decisions WHERE Action != 'suppressed'"); d != 3 {
 		t.Fatalf("a restart recorded bans or manual entries again: %d decisions", d)
 	}
 }

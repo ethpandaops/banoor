@@ -118,6 +118,27 @@ func (f *fakeSource) count(table string) int {
 	return len(f.inserted[table])
 }
 
+// decisions returns the recorded decisions as "action cidr", without the
+// suppression reports.
+func (f *fakeSource) decisions(withSuppressed bool) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var out []string
+
+	for _, d := range f.inserted["state.decisions"] {
+		if d[2] == actionSuppressed && !withSuppressed {
+			continue
+		}
+
+		out = append(out, fmt.Sprintf("%s %s", d[2], d[3]))
+	}
+
+	slices.Sort(out)
+
+	return out
+}
+
 const testConfig = `{
 	"fetchUserHeader": "X-User",
 	"source": {"dsn": "clickhouse://test@127.0.0.1:9000"},
@@ -286,9 +307,15 @@ func TestScorerEndToEnd(t *testing.T) {
 		t.Fatalf("payload = %+v", p)
 	}
 
-	// Three bans and two manual entries recorded, one generation.
-	if src.count("state.decisions") != 5 || src.count("state.publishes") != 1 {
-		t.Fatalf("recorded %d decisions and %d publishes", src.count("state.decisions"), src.count("state.publishes"))
+	// Three bans, two manual entries and two suppressions recorded, one
+	// generation.
+	want := []string{
+		"ban 198.51.100.1/32", "ban 198.51.100.4/32", "ban 203.0.113.9/32",
+		"manual_ban 192.0.2.0/24", "manual_lift 198.51.100.20/32",
+		"suppressed 198.51.100.20/32", "suppressed 198.51.100.3/32",
+	}
+	if got := src.decisions(true); !slices.Equal(got, want) || src.count("state.publishes") != 1 {
+		t.Fatalf("recorded %v and %d publishes, want %v", got, src.count("state.publishes"), want)
 	}
 
 	first := h.sc.Current()
@@ -363,8 +390,8 @@ func TestFailedWritesPublishNothing(t *testing.T) {
 
 	// Four bans at the start, then .9 once: recorded when its run failed to
 	// publish, and not again.
-	if n := src.count("state.decisions"); n != 5 {
-		t.Fatalf("decisions = %d, want 5", n)
+	if n := len(src.decisions(false)); n != 5 {
+		t.Fatalf("decisions = %v, want 5", src.decisions(false))
 	}
 
 	if got := metricsText(t, h.reg); !strings.Contains(got, `banoor_run_blocked_total{reason="record"} 2`) {
@@ -484,7 +511,7 @@ func TestRestartContinuesFromTheState(t *testing.T) {
 	}
 
 	before := h.payload()
-	decisions := src.count("state.decisions")
+	decisions := len(src.decisions(false))
 
 	h2 := newHarness(t, src, key, manualFile)
 	h2.clock = t0.Add(time.Minute)
@@ -502,7 +529,7 @@ func TestRestartContinuesFromTheState(t *testing.T) {
 		t.Fatalf("after a restart generation %d follows %d, want to follow %d", after.Generation, after.PreviousGeneration, before.Generation)
 	}
 
-	if n := src.count("state.decisions"); n != decisions {
+	if n := len(src.decisions(false)); n != decisions {
 		t.Fatalf("a restart recorded bans or manual entries again: %d decisions, want %d", n, decisions)
 	}
 }

@@ -32,6 +32,15 @@ func (s *Scorer) defineMetrics() {
 	m.Gauge("banoor_run_duration_seconds", "How long the last successful run took.")
 }
 
+func suppressedKeys(ss []engine.Suppression) []string {
+	out := make([]string, len(ss))
+	for i, s := range ss {
+		out[i] = s.Prefix.String()
+	}
+
+	return out
+}
+
 func strs(ps []netip.Prefix) []string {
 	out := make([]string, len(ps))
 	for i, p := range ps {
@@ -83,18 +92,17 @@ func (s *Scorer) observe(res engine.Result, start time.Time) {
 	}
 
 	m.Set("banoor_suppressed", float64(len(res.Suppressed)))
-	m.Add("banoor_suppressed_total", float64(s.episodes.observe("suppressed", strs(res.Suppressed))))
 
 	for _, reason := range engine.DeferReasons {
 		units := res.Deferred[reason]
 		m.Set("banoor_deferred", float64(len(units)), "reason", reason)
-		m.Add("banoor_deferred_total", float64(s.episodes.observe("deferred:"+reason, strs(units))), "reason", reason)
+		m.Add("banoor_deferred_total", float64(len(s.episodes.observe("deferred:"+reason, strs(units)))), "reason", reason)
 	}
 
 	for _, sig := range s.cfg.Signals {
 		if sig.Mode == "shadow" {
 			units := res.WouldBan[sig.Name]
-			m.Add("banoor_signal_would_ban_total", float64(s.episodes.observe("would:"+sig.Name, strs(units))), "signal", sig.Name)
+			m.Add("banoor_signal_would_ban_total", float64(len(s.episodes.observe("would:"+sig.Name, strs(units)))), "signal", sig.Name)
 		}
 	}
 
@@ -119,19 +127,20 @@ type episodes struct {
 
 func newEpisodes() *episodes { return &episodes{seen: map[string]map[string]bool{}} }
 
-// observe replaces the set for group with keys and returns how many keys
+// observe replaces the set for group with keys and returns the keys that
 // were not in it before.
-func (e *episodes) observe(group string, keys []string) int {
+func (e *episodes) observe(group string, keys []string) []string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	prev := e.seen[group]
 	next := make(map[string]bool, len(keys))
-	n := 0
+
+	var fresh []string
 
 	for _, k := range keys {
 		if !prev[k] && !next[k] {
-			n++
+			fresh = append(fresh, k)
 		}
 
 		next[k] = true
@@ -139,5 +148,5 @@ func (e *episodes) observe(group string, keys []string) int {
 
 	e.seen[group] = next
 
-	return n
+	return fresh
 }

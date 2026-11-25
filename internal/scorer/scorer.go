@@ -185,6 +185,7 @@ func (s *Scorer) RunOnce(ctx context.Context) error {
 	}
 
 	s.storeFetchers(ctx)
+	s.reportSuppressed(ctx, res)
 	s.lastSuccess.Store(s.now().UnixNano())
 	s.observe(res, start)
 
