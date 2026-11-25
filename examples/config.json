@@ -8,7 +8,7 @@
     "passwordFile": "/run/secrets/clickhouse-password",
     "timeout": "20s",
     "settings": {
-      "max_execution_time": "20"
+      "max_memory_usage": "2000000000"
     }
   },
   "tables": {
