@@ -1,0 +1,75 @@
+{
+  "fetchUserHeader": "X-Forwarded-User",
+  "interval": "30s",
+  "refresh": "60s",
+  "source": {
+    "type": "clickhouse",
+    "dsn": "clickhouse://banoor@clickhouse:9000",
+    "passwordFile": "/run/secrets/clickhouse-password",
+    "timeout": "20s",
+    "settings": {
+      "max_execution_time": "20"
+    }
+  },
+  "tables": {
+    "decisions": "banoor.decisions",
+    "publishes": "banoor.publishes",
+    "control": "banoor.control",
+    "fetchers": "banoor.fetchers"
+  },
+  "signing": {
+    "keyFile": "/run/secrets/signing-key",
+    "namespace": "example-banlist"
+  },
+  "defaultMode": "shadow",
+  "threshold": 50,
+  "window": "24h",
+  "ipv6Prefix": 64,
+  "ban": {
+    "base": "24h",
+    "max": "504h",
+    "repeatWindow": "720h"
+  },
+  "signals": [
+    {
+      "name": "invalid_user",
+      "mode": "count",
+      "weight": 1,
+      "query": "SELECT Address AS address, Feeder AS feeder, sum(Attempts) AS attempts FROM banoor.ssh_failures WHERE Kind = 'invalid_user' AND Minute >= now() - toIntervalSecond({window:UInt32}) GROUP BY address, feeder"
+    },
+    {
+      "name": "not_allowed",
+      "mode": "count",
+      "weight": 1,
+      "query": "SELECT Address AS address, Feeder AS feeder, sum(Attempts) AS attempts FROM banoor.ssh_failures WHERE Kind = 'not_allowed' AND Minute >= now() - toIntervalSecond({window:UInt32}) GROUP BY address, feeder"
+    },
+    {
+      "name": "penalty_drop",
+      "mode": "shadow",
+      "weight": 0,
+      "query": "SELECT Address AS address, Feeder AS feeder, sum(Attempts) AS attempts FROM banoor.ssh_failures WHERE Kind = 'penalty_drop' AND Minute >= now() - toIntervalSecond({window:UInt32}) GROUP BY address, feeder"
+    }
+  ],
+  "allow": {
+    "dir": "/etc/banoor/allowlist",
+    "queries": [],
+    "fetchers": {
+      "addressHeader": "X-Real-Ip",
+      "users": "^host-",
+      "window": "720h"
+    }
+  },
+  "manualFile": "/etc/banoor/manual.json",
+  "limits": {
+    "ipv4MinPrefix": 24,
+    "ipv6MinPrefix": 48
+  },
+  "caps": {
+    "maxEntries": 5000,
+    "maxAddedPerGeneration": 500,
+    "maxNewPerHour": 200,
+    "maxNewPerFeederPerHour": 50,
+    "maxIPv4Addresses": 1048576,
+    "maxIPv6Networks": 1048576
+  }
+}
