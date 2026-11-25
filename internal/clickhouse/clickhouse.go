@@ -23,7 +23,8 @@ type Options struct {
 	Password string
 	// Timeout bounds dialling and each read.
 	Timeout time.Duration
-	// Settings are sent with every query, such as max_execution_time.
+	// Settings are sent with every query, such as max_memory_usage. The
+	// client sets max_execution_time from the context's deadline.
 	Settings map[string]string
 	// InsertSettings are sent with every insert, such as
 	// distributed_foreground_insert for Distributed tables.

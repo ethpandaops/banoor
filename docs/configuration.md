@@ -44,7 +44,7 @@ A first ban lasts `ban.base`; each earlier ban of the same source within
 | `source.dsn` | | `clickhouse://user@host:9000/db` (native) or `http(s)://user@host:8123/db` |
 | `source.passwordFile` | | overrides the DSN's password |
 | `source.timeout` | `20s` | dial and read timeout |
-| `source.settings` | | sent with every query, such as `max_execution_time` |
+| `source.settings` | | sent with every query, such as `max_memory_usage`. The client sets `max_execution_time` itself, to the run's remaining time plus 5 s (up to `interval` + 5 s), so a settings profile constraint must allow that |
 | `source.insertSettings` | | sent with every insert, such as `distributed_foreground_insert` for Distributed tables |
 | `tables.decisions`, `tables.publishes`, `tables.control` | | state tables |
 | `tables.fetchers` | | with `allow.fetchers` |
