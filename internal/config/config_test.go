@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestExampleLoads(t *testing.T) {
@@ -33,7 +34,7 @@ const base = `{
 	"allow": {"queries": [{"name": "q", "query": "SELECT 2", "window": "720h", "refresh": "1h"}]}
 }`
 
-func load(t *testing.T, body string) error {
+func load(t *testing.T, body string) (*Config, error) {
 	t.Helper()
 
 	path := filepath.Join(t.TempDir(), "c.json")
@@ -41,16 +42,22 @@ func load(t *testing.T, body string) error {
 		t.Fatal(err)
 	}
 
-	_, err := Load(path)
-
-	return err
+	return Load(path)
 }
 
 func TestDefaultsApply(t *testing.T) {
 	t.Parallel()
 
-	if err := load(t, base); err != nil {
+	c, err := load(t, base)
+	if err != nil {
 		t.Fatal(err)
+	}
+
+	ec := c.Engine()
+	if c.Interval.Duration != 30*time.Second || c.Refresh.Duration != time.Minute || c.DefaultMode != "shadow" ||
+		ec.Threshold != 50 || ec.Window != 24*time.Hour || ec.IPv6Prefix != 64 || ec.BanBase != 24*time.Hour ||
+		ec.Caps.MaxEntries != 5000 || ec.Caps.MaxNewPerFeederPerHour != 50 || c.Limits.IPv6MinPrefix != 48 {
+		t.Errorf("defaults = %+v, engine %+v", c, ec)
 	}
 }
 
@@ -64,7 +71,10 @@ func TestValidateRejects(t *testing.T) {
 		"bad default":             {`"signals"`, `"defaultMode": "off", "signals"`, "defaultMode"},
 		"parser no kinds":         {`"mode": "count"`, `"mode": "count", "parser": "openssh"`, "needs kinds"},
 		"unknown kind":            {`"mode": "count"`, `"mode": "count", "parser": "openssh", "kinds": ["root_login"]`, `unknown kind "root_login"`},
-		"negative weight":         {`"weight": 1`, `"weight": -1`, "cannot be negative"},
+		"negative weight":         {`"weight": 1`, `"weight": -1`, "weight must be positive"},
+		"zero weight":             {`"weight": 1`, `"weight": 0`, "weight must be positive"},
+		"ban shorter than window": {`"signals"`, `"ban": {"base": "1h"}, "signals"`, "ban.base 1h0m0s must be at least the window"},
+		"data after":              {`"1h"}]}`, `"1h"}]}}{`, "data after the configuration"},
 		"bad duration":            {`"signals"`, `"window": 86400, "signals"`, "durations are strings"},
 		"wide ipv6 unit":          {`"signals"`, `"ipv6Prefix": 32, "signals"`, "ipv6Prefix 32"},
 		"other source":            {`"dsn"`, `"type": "postgres", "dsn"`, "only clickhouse"},
@@ -91,7 +101,7 @@ func TestValidateRejects(t *testing.T) {
 				t.Fatal("the replacement did not apply")
 			}
 
-			err := load(t, body)
+			_, err := load(t, body)
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("got %v, want an error containing %q", err, tt.want)
 			}

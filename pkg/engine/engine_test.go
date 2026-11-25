@@ -40,7 +40,25 @@ func testConfig() Config {
 
 func rows(r ...Row) []Row { return r }
 
-func invalid(r ...Row) map[string][]Row { return map[string][]Row{"invalid_user": r} }
+// tallies counts rows by signal, as the scorer does while it reads them.
+func tallies(e *Engine, bySignal map[string][]Row) map[string]*Tally {
+	out := map[string]*Tally{}
+
+	for name, rs := range bySignal {
+		t := e.NewTally()
+		for _, r := range rs {
+			t.Add(r)
+		}
+
+		out[name] = t
+	}
+
+	return out
+}
+
+func invalid(e *Engine, r ...Row) map[string]*Tally {
+	return tallies(e, map[string][]Row{"invalid_user": r})
+}
 
 func cidrs(es []Entry) []string {
 	out := make([]string, 0, len(es))
@@ -110,10 +128,10 @@ func TestThresholdIsSummedAcrossFeeders(t *testing.T) {
 	t.Parallel()
 
 	e := New(testConfig())
-	r := step(e, Inputs{Now: t0, Rows: map[string][]Row{
+	r := step(e, Inputs{Now: t0, Tallies: tallies(e, map[string][]Row{
 		"invalid_user": rows(Row{"198.51.100.1", "host-a", 25}, Row{"198.51.100.2", "host-a", 49}),
 		"not_allowed":  rows(Row{"198.51.100.1", "host-b", 30}),
-	}})
+	})})
 
 	if got := cidrs(r.Entries); !slices.Equal(got, []string{"198.51.100.1/32"}) {
 		t.Fatalf("entries = %v, want only the source at 25+30", got)
@@ -144,7 +162,7 @@ func TestWeightsCapsAndShadowSignals(t *testing.T) {
 	)
 	e := New(cfg)
 
-	r := step(e, Inputs{Now: t0, Allow: netaddr.NewSet(netip.MustParsePrefix("198.51.100.6/32")), Rows: map[string][]Row{
+	r := step(e, Inputs{Now: t0, Allow: netaddr.NewSet(netip.MustParsePrefix("198.51.100.6/32")), Tallies: tallies(e, map[string][]Row{
 		// A weight-0 signal never bans, however loud.
 		"drop": rows(Row{"198.51.100.1", "h", 10000}),
 		// The cap is per source, not per row: 60 + 60 attempts from two
@@ -160,7 +178,7 @@ func TestWeightsCapsAndShadowSignals(t *testing.T) {
 		// The shadow signal would put .4 over (30 + 20); .5 is over already
 		// and .6 is allowlisted, so neither is a would-ban.
 		"trial": rows(Row{"198.51.100.4", "h", 20}, Row{"198.51.100.5", "h", 20}, Row{"198.51.100.6", "h", 20}),
-	}})
+	})})
 
 	if got := cidrs(r.Entries); !slices.Equal(got, []string{"198.51.100.3/32", "198.51.100.5/32"}) {
 		t.Fatalf("entries = %v", got)
@@ -175,7 +193,7 @@ func TestIPv6IsScoredPerNetwork(t *testing.T) {
 	t.Parallel()
 
 	e := New(testConfig())
-	r := step(e, Inputs{Now: t0, Rows: invalid(
+	r := step(e, Inputs{Now: t0, Tallies: invalid(e,
 		Row{"2001:db8:1:2::a", "h", 30},
 		Row{"2001:db8:1:2:ffff::b", "h", 20},
 		Row{"2001:db8:1:3::a", "h", 49},
@@ -200,7 +218,7 @@ func TestAllowlistAndLiftsWin(t *testing.T) {
 
 	e := New(testConfig())
 	allow := netaddr.NewSet(netip.MustParsePrefix("2001:db8:1:2::7/128"), netip.MustParsePrefix("198.51.100.0/28"))
-	in := Inputs{Now: t0, Allow: allow, Rows: invalid(
+	in := Inputs{Now: t0, Allow: allow, Tallies: invalid(e,
 		Row{"2001:db8:1:2::a", "h", 60}, // its /64 holds an allowed address
 		Row{"198.51.100.5", "h", 60},    // inside an allowed range
 		Row{"198.51.100.20", "h", 60},
@@ -247,10 +265,10 @@ func TestBlockedManualBanHidesNothing(t *testing.T) {
 	// so the sources inside it are scored as usual.
 	e := New(testConfig())
 	r := step(e, Inputs{
-		Now:    t0,
-		Allow:  netaddr.NewSet(netip.MustParsePrefix("203.0.113.5/32")),
-		Manual: []manual.Entry{ban("203.0.113.0/24", t0.Add(time.Hour)), lift("198.51.100.0/24", t0.Add(time.Hour)), ban("198.51.100.0/24", t0.Add(time.Hour))},
-		Rows:   invalid(Row{"203.0.113.7", "h", 500}),
+		Now:     t0,
+		Allow:   netaddr.NewSet(netip.MustParsePrefix("203.0.113.5/32")),
+		Manual:  []manual.Entry{ban("203.0.113.0/24", t0.Add(time.Hour)), lift("198.51.100.0/24", t0.Add(time.Hour)), ban("198.51.100.0/24", t0.Add(time.Hour))},
+		Tallies: invalid(e, Row{"203.0.113.7", "h", 500}),
 	})
 
 	if got := cidrs(r.Entries); !slices.Equal(got, []string{"203.0.113.7/32"}) {
@@ -271,7 +289,7 @@ func TestSuppressedComeOutInOrder(t *testing.T) {
 	}
 
 	e := New(testConfig())
-	r := e.Step(Inputs{Now: t0, Mode: Enforce, Allow: netaddr.NewSet(netip.MustParsePrefix("198.51.100.0/24")), Rows: invalid(in...)})
+	r := e.Step(Inputs{Now: t0, Mode: Enforce, Allow: netaddr.NewSet(netip.MustParsePrefix("198.51.100.0/24")), Tallies: invalid(e, in...)})
 
 	if len(r.Suppressed) != 20 || !slices.IsSortedFunc(r.Suppressed, func(a, b Suppression) int { return a.Prefix.Compare(b.Prefix) }) {
 		t.Errorf("suppressed = %v", r.Suppressed)
@@ -290,7 +308,7 @@ func TestHeldBackManualBanHidesNothing(t *testing.T) {
 		bans = append(bans, ban(fmt.Sprintf("2001:db8:%x::/48", i), t0.Add(time.Hour)))
 	}
 
-	r := step(e, Inputs{Now: t0, Manual: bans, Rows: invalid(Row{"2001:db8:f::1", "h", 500}, Row{"198.51.100.1", "h", 60})})
+	r := step(e, Inputs{Now: t0, Manual: bans, Tallies: invalid(e, Row{"2001:db8:f::1", "h", 500}, Row{"198.51.100.1", "h", 60})})
 	if got := strs(r.Deferred[DeferCoverage]); !slices.Equal(got, []string{"2001:db8:f::/48", "2001:db8:f::/64"}) {
 		t.Errorf("coverage-deferred = %v", got)
 	}
@@ -326,7 +344,7 @@ func TestRepeatBansDouble(t *testing.T) {
 	t.Parallel()
 
 	e := New(testConfig())
-	in := Inputs{Rows: invalid(Row{"198.51.100.1", "h", 80})}
+	in := Inputs{Tallies: invalid(e, Row{"198.51.100.1", "h", 80})}
 	now := t0
 
 	for i, h := range []time.Duration{24, 48, 96, 192} {
@@ -376,7 +394,7 @@ func TestBanLengthCapsAtMaximum(t *testing.T) {
 
 	e.Restore(earlier, nil, nil)
 
-	r := step(e, Inputs{Now: t0, Rows: invalid(Row{"198.51.100.1", "h", 80})})
+	r := step(e, Inputs{Now: t0, Tallies: invalid(e, Row{"198.51.100.1", "h", 80})})
 	if got := r.NewBans[0].Expires.Sub(t0); got != 21*24*time.Hour || r.NewBans[0].Number != 7 {
 		t.Fatalf("seventh ban lasts %v, number %d", got, r.NewBans[0].Number)
 	}
@@ -390,7 +408,7 @@ func TestHourAndFeederCapsDeferTheLowestScores(t *testing.T) {
 	cfg.Caps.MaxNewPerFeederPerHour = 2
 	e := New(cfg)
 
-	in := Inputs{Now: t0, Rows: invalid(
+	in := Inputs{Now: t0, Tallies: invalid(e,
 		Row{"198.51.100.1", "noisy", 500},
 		Row{"198.51.100.2", "noisy", 400},
 		Row{"198.51.100.3", "noisy", 300}, // the noisy feeder's third: feeder cap
@@ -427,7 +445,7 @@ func TestFeederCapChargesOnlyTheTopFeeder(t *testing.T) {
 	cfg.Caps.MaxNewPerFeederPerHour = 1
 	e := New(cfg)
 
-	r := step(e, Inputs{Now: t0, Rows: invalid(
+	r := step(e, Inputs{Now: t0, Tallies: invalid(e,
 		Row{"198.51.100.1", "noisy", 40}, Row{"198.51.100.1", "quiet", 20}, // charged to noisy
 		Row{"198.51.100.2", "quiet", 60},
 		Row{"198.51.100.3", "noisy", 55},
@@ -449,7 +467,7 @@ func TestGenerationCapHoldsBackNewBans(t *testing.T) {
 	cfg.Caps.MaxAddedPerGeneration = 1
 	e := New(cfg)
 
-	r := step(e, Inputs{Now: t0, Rows: invalid(Row{"198.51.100.1", "h", 90}, Row{"198.51.100.2", "h", 80})})
+	r := step(e, Inputs{Now: t0, Tallies: invalid(e, Row{"198.51.100.1", "h", 90}, Row{"198.51.100.2", "h", 80})})
 	if got := banned(r); !slices.Equal(got, []string{"198.51.100.1/32"}) {
 		t.Fatalf("new bans = %v; a ban that waits must not be issued", got)
 	}
@@ -467,7 +485,7 @@ func TestRestoredBansCountTowardTheHourCap(t *testing.T) {
 	e := New(cfg)
 	e.Restore([]Ban{{Unit: netip.MustParsePrefix("192.0.2.1/32"), Issued: t0.Add(-time.Minute), Expires: t0.Add(time.Hour), Points: 60}}, nil, []string{"192.0.2.1/32"})
 
-	r := step(e, Inputs{Now: t0, Rows: invalid(Row{"198.51.100.1", "h", 90})})
+	r := step(e, Inputs{Now: t0, Tallies: invalid(e, Row{"198.51.100.1", "h", 90})})
 	if len(r.NewBans) != 0 || len(r.Deferred[DeferHourCap]) != 1 {
 		t.Fatalf("new bans %v, deferred %v", banned(r), r.Deferred)
 	}
@@ -479,13 +497,13 @@ func TestMaxEntriesKeepsTheHighestScores(t *testing.T) {
 	cfg := testConfig()
 	cfg.Caps.MaxEntries = 2
 	e := New(cfg)
-	in := Inputs{Now: t0, Rows: invalid(Row{"198.51.100.1", "h", 50}, Row{"198.51.100.2", "h", 51})}
+	in := Inputs{Now: t0, Tallies: invalid(e, Row{"198.51.100.1", "h", 50}, Row{"198.51.100.2", "h", 51})}
 	step(e, in)
 
 	// A much louder source takes the lowest ban's place and is banned; the
 	// displaced ban waits, still in force.
 	in.Now = t0.Add(time.Minute)
-	in.Rows = invalid(Row{"198.51.100.1", "h", 50}, Row{"198.51.100.2", "h", 51}, Row{"198.51.100.3", "h", 100000})
+	in.Tallies = invalid(e, Row{"198.51.100.1", "h", 50}, Row{"198.51.100.2", "h", 51}, Row{"198.51.100.3", "h", 100000})
 
 	r := step(e, in)
 	if got := cidrs(r.Entries); !slices.Equal(got, []string{"198.51.100.2/32", "198.51.100.3/32"}) {
@@ -503,7 +521,7 @@ func TestMaxEntriesKeepsTheHighestScores(t *testing.T) {
 	// Lifted bans take no place in the list.
 	in.Now = t0.Add(2 * time.Minute)
 	in.Manual = []manual.Entry{lift("198.51.100.2/32", t0.Add(time.Hour)), lift("198.51.100.3/32", t0.Add(time.Hour))}
-	in.Rows = invalid(Row{"198.51.100.4", "h", 60})
+	in.Tallies = invalid(e, Row{"198.51.100.4", "h", 60})
 
 	r = step(e, in)
 	if got := cidrs(r.Entries); !slices.Equal(got, []string{"198.51.100.1/32", "198.51.100.4/32"}) {
@@ -519,7 +537,7 @@ func TestCoverageCapIssuesOnlyWhatFits(t *testing.T) {
 	cfg.Caps.MaxIPv6Networks = 2 << 16 // two /48s
 	e := New(cfg)
 
-	r := step(e, Inputs{Now: t0, Rows: invalid(
+	r := step(e, Inputs{Now: t0, Tallies: invalid(e,
 		Row{"2001:db8:1::1", "h", 90}, Row{"2001:db8:2::1", "h", 80}, Row{"2001:db8:3::1", "h", 70},
 		Row{"198.51.100.1", "h", 60},
 	)})
@@ -539,7 +557,7 @@ func TestManualBansComeFirstAndAreListedOnce(t *testing.T) {
 	cfg := testConfig()
 	cfg.Caps.MaxEntries = 2
 	e := New(cfg)
-	step(e, Inputs{Now: t0, Rows: invalid(Row{"198.51.100.1", "h", 90}, Row{"198.51.100.2", "h", 80})})
+	step(e, Inputs{Now: t0, Tallies: invalid(e, Row{"198.51.100.1", "h", 90}, Row{"198.51.100.2", "h", 80})})
 
 	// The same prefix banned by hand is listed once, as manual, and the
 	// manual /24 pushes the lower scored ban out.
@@ -570,17 +588,19 @@ func TestEmptyAndTheGenerationCap(t *testing.T) {
 	cfg := testConfig()
 	cfg.Caps.MaxAddedPerGeneration = 2
 	e := New(cfg)
-	in := Inputs{Now: t0, Mode: Empty, Rows: invalid(
+	in := Inputs{Now: t0, Mode: Empty, Tallies: invalid(e,
 		Row{"198.51.100.1", "h", 90}, Row{"198.51.100.2", "h", 80}, Row{"198.51.100.3", "h", 70},
 		Row{"198.51.100.4", "h", 60}, Row{"198.51.100.5", "h", 55},
 	)}
 
+	// Empty mode bans nothing it would not publish.
 	r := step(e, in)
-	if r.Entries == nil || len(r.Entries) != 0 || len(r.NewBans) != 5 {
+	if r.Entries == nil || len(r.Entries) != 0 || len(r.NewBans) != 0 {
 		t.Fatalf("empty mode: entries %v (nil %v), new bans %d", r.Entries, r.Entries == nil, len(r.NewBans))
 	}
 
-	// Back to enforce: two additions per generation, highest scores first.
+	// Back to enforce: two additions per generation, highest scores first,
+	// each a first ban.
 	in.Mode = Enforce
 	wants := [][]string{
 		{"198.51.100.1/32", "198.51.100.2/32"},
@@ -595,6 +615,112 @@ func TestEmptyAndTheGenerationCap(t *testing.T) {
 		if got := cidrs(r.Entries); !slices.Equal(got, want) {
 			t.Fatalf("generation %d: entries = %v, want %v", i+1, got, want)
 		}
+
+		for _, b := range r.NewBans {
+			if b.Number != 1 {
+				t.Errorf("%s is ban %d, want 1", b.Unit, b.Number)
+			}
+		}
+	}
+
+	// Back to empty, the bans in force stay off the list and stay in force.
+	in.Mode, in.Now = Empty, in.Now.Add(time.Minute)
+	if r = step(e, in); len(r.Entries) != 0 || len(r.NewBans) != 0 {
+		t.Fatalf("empty again: entries %v, new bans %d", cidrs(r.Entries), len(r.NewBans))
+	}
+
+	in.Mode, in.Now = Enforce, in.Now.Add(time.Minute)
+	if r = step(e, in); len(r.Entries) != 2 || len(r.NewBans) != 0 {
+		t.Errorf("enforce again: entries %v, new bans %d, want two bans in force back", cidrs(r.Entries), len(r.NewBans))
+	}
+}
+
+func TestNoNewDecisionsStillShrinksTheList(t *testing.T) {
+	t.Parallel()
+
+	e := New(testConfig())
+	step(e, Inputs{Now: t0, Tallies: invalid(e, Row{"198.51.100.1", "h", 90}, Row{"198.51.100.2", "h", 90})})
+
+	// The next step cannot record: the new loud source and the new manual
+	// ban wait, while the lift and the expiry still apply.
+	in := Inputs{
+		Now:     t0.Add(time.Minute),
+		Tallies: invalid(e, Row{"198.51.100.1", "h", 90}, Row{"198.51.100.2", "h", 90}, Row{"198.51.100.3", "h", 90}),
+		Manual: []manual.Entry{
+			lift("198.51.100.1/32", t0.Add(time.Hour)),
+			ban("203.0.113.0/24", t0.Add(time.Hour)),
+		},
+		NoNewDecisions: true,
+	}
+
+	r := step(e, in)
+	if got := cidrs(r.Entries); !slices.Equal(got, []string{"198.51.100.2/32", "203.0.113.0/24"}) {
+		t.Fatalf("entries = %v", got)
+	}
+
+	if len(r.NewBans) != 0 || len(r.NewManual) != 0 {
+		t.Fatalf("new bans %v, new manual %v, want none", banned(r), r.NewManual)
+	}
+
+	// Once it can record again, both are decided.
+	in.NoNewDecisions = false
+	if r = step(e, in); !slices.Equal(banned(r), []string{"198.51.100.3/32"}) || len(r.NewManual) != 2 {
+		t.Errorf("after recovering: new bans %v, new manual %d", banned(r), len(r.NewManual))
+	}
+}
+
+func TestAllowingABanInForceIsReported(t *testing.T) {
+	t.Parallel()
+
+	e := New(testConfig())
+	in := Inputs{Now: t0, Tallies: invalid(e, Row{"198.51.100.1", "h", 90})}
+	step(e, in)
+
+	// No new evidence, so the source is no candidate: only the ban in force
+	// can say it was kept off.
+	in.Now, in.Tallies = t0.Add(time.Minute), nil
+	in.Allow = netaddr.NewSet(netip.MustParsePrefix("198.51.100.0/24"))
+
+	r := step(e, in)
+	if len(r.Entries) != 0 {
+		t.Fatalf("entries = %v", cidrs(r.Entries))
+	}
+
+	if got := suppressed(r); !slices.Equal(got, []string{"198.51.100.1/32 allowlist"}) {
+		t.Errorf("suppressed = %v", got)
+	}
+
+	if r.Suppressed[0].Points != 90 || r.Suppressed[0].Manual {
+		t.Errorf("suppression = %+v", r.Suppressed[0])
+	}
+}
+
+func TestABanRecordedTwiceCountsOnce(t *testing.T) {
+	t.Parallel()
+
+	u := netip.MustParsePrefix("198.51.100.1/32")
+	first := Ban{Unit: u, Issued: t0, Expires: t0.Add(24 * time.Hour), Points: 60, Number: 1, Feeders: []string{"h"}}
+	again := first
+	again.Issued, again.Expires = t0.Add(30*time.Second), t0.Add(24*time.Hour+30*time.Second)
+
+	e := New(testConfig())
+	e.Restore([]Ban{again, first}, nil, nil)
+
+	// The duplicate is not a repeat: the next ban is the second, 48h.
+	r := step(e, Inputs{Now: t0.Add(25 * time.Hour), Tallies: invalid(e, Row{"198.51.100.1", "h", 60})})
+	if len(r.NewBans) != 1 || r.NewBans[0].Number != 2 || r.NewBans[0].Expires.Sub(r.Now) != 48*time.Hour {
+		t.Fatalf("new bans = %+v", r.NewBans)
+	}
+
+	// Nor does it count twice toward the hourly cap.
+	cfg := testConfig()
+	cfg.Caps.MaxNewPerHour = 2
+	e = New(cfg)
+	e.Restore([]Ban{first, again}, nil, nil)
+
+	r = step(e, Inputs{Now: t0.Add(time.Minute), Tallies: invalid(e, Row{"198.51.100.2", "h", 60})})
+	if !slices.Equal(banned(r), []string{"198.51.100.2/32"}) {
+		t.Errorf("new bans = %v, deferred = %v", banned(r), r.Deferred)
 	}
 }
 
@@ -634,7 +760,7 @@ func TestStepDoesNotChangeTheEngine(t *testing.T) {
 	cfg := testConfig()
 	cfg.Caps.MaxNewPerHour = 1
 	e := New(cfg)
-	in := Inputs{Now: t0, Mode: Enforce, Rows: invalid(Row{"198.51.100.1", "h", 90}), Manual: []manual.Entry{ban("203.0.113.0/24", t0.Add(time.Hour))}}
+	in := Inputs{Now: t0, Mode: Enforce, Tallies: invalid(e, Row{"198.51.100.1", "h", 90}), Manual: []manual.Entry{ban("203.0.113.0/24", t0.Add(time.Hour))}}
 
 	first := e.Step(in)
 

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"time"
@@ -47,9 +48,6 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 
 	return nil
 }
-
-// MarshalJSON writes the duration as a string.
-func (d Duration) MarshalJSON() ([]byte, error) { return json.Marshal(d.String()) }
 
 // Signal is a query and how much its rows count. The query returns one row
 // per source and feeder with the columns address, feeder and attempts. With
@@ -125,16 +123,6 @@ type Allow struct {
 	Fetchers *Fetchers    `json:"fetchers"`
 }
 
-// Caps bound what one run may publish and ban.
-type Caps struct {
-	MaxEntries             int    `json:"maxEntries"`
-	MaxAddedPerGeneration  int    `json:"maxAddedPerGeneration"`
-	MaxNewPerHour          int    `json:"maxNewPerHour"`
-	MaxNewPerFeederPerHour int    `json:"maxNewPerFeederPerHour"`
-	MaxIPv4Addresses       uint64 `json:"maxIPv4Addresses"`
-	MaxIPv6Networks        uint64 `json:"maxIPv6Networks"`
-}
-
 // Config is the whole configuration.
 type Config struct {
 	FetchUserHeader string         `json:"fetchUserHeader"`
@@ -152,7 +140,7 @@ type Config struct {
 	Allow           Allow          `json:"allow"`
 	ManualFile      string         `json:"manualFile"`
 	Limits          netaddr.Limits `json:"limits"`
-	Caps            Caps           `json:"caps"`
+	Caps            engine.Caps    `json:"caps"`
 }
 
 // Default returns the configuration every file starts from.
@@ -171,7 +159,7 @@ func Default() Config {
 			RepeatWindow: Duration{30 * 24 * time.Hour},
 		},
 		Limits: netaddr.DefaultLimits,
-		Caps: Caps{
+		Caps: engine.Caps{
 			MaxEntries:             5000,
 			MaxAddedPerGeneration:  500,
 			MaxNewPerHour:          200,
@@ -196,6 +184,10 @@ func Load(path string) (*Config, error) {
 
 	if err = dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+
+	if err = dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("%s: data after the configuration", path)
 	}
 
 	if err = c.Validate(); err != nil {
@@ -275,6 +267,12 @@ func (c *Config) validatePolicy() error {
 		errs = append(errs, fmt.Errorf("ban: base must be positive and no longer than max; max and repeatWindow positive and at most %s", maxBan))
 	}
 
+	// Signals count over the window, so a ban that ended sooner would be
+	// issued again, and escalated, on the evidence of the first.
+	if c.Ban.Base.Duration < c.Window.Duration {
+		errs = append(errs, fmt.Errorf("ban.base %s must be at least the window, %s", c.Ban.Base.Duration, c.Window.Duration))
+	}
+
 	caps := c.Caps
 	if caps.MaxEntries <= 0 || caps.MaxAddedPerGeneration <= 0 || caps.MaxNewPerHour <= 0 || caps.MaxNewPerFeederPerHour <= 0 ||
 		caps.MaxIPv4Addresses == 0 || caps.MaxIPv6Networks == 0 {
@@ -321,8 +319,8 @@ func validateSignal(s Signal) error {
 		errs = append(errs, fmt.Errorf("mode %q, want count or shadow", s.Mode))
 	}
 
-	if s.Weight < 0 || s.Cap < 0 {
-		errs = append(errs, errors.New("weight and cap cannot be negative"))
+	if s.Weight <= 0 || s.Cap < 0 {
+		errs = append(errs, errors.New("weight must be positive and cap cannot be negative"))
 	}
 
 	switch s.Parser {
@@ -399,14 +397,7 @@ func (c *Config) Engine() engine.Config {
 		BanBase:      c.Ban.Base.Duration,
 		BanMax:       c.Ban.Max.Duration,
 		RepeatWindow: c.Ban.RepeatWindow.Duration,
-		Caps: engine.Caps{
-			MaxEntries:             c.Caps.MaxEntries,
-			MaxAddedPerGeneration:  c.Caps.MaxAddedPerGeneration,
-			MaxNewPerHour:          c.Caps.MaxNewPerHour,
-			MaxNewPerFeederPerHour: c.Caps.MaxNewPerFeederPerHour,
-			MaxIPv4Addresses:       c.Caps.MaxIPv4Addresses,
-			MaxIPv6Networks:        c.Caps.MaxIPv6Networks,
-		},
+		Caps:         c.Caps,
 	}
 
 	for _, s := range c.Signals {

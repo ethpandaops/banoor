@@ -6,23 +6,24 @@ import (
 	"time"
 
 	"github.com/ethpandaops/banoor/pkg/engine"
+	"github.com/ethpandaops/banoor/pkg/manual"
 	"github.com/ethpandaops/banoor/pkg/netaddr"
 )
 
 func (s *Scorer) defineMetrics() {
 	m := s.metrics
-	m.Gauge("banoor_mode", "1 for the kill switch's current mode.")
+	m.Gauge("banoor_mode", "1 for the kill switch's mode, as last read.")
 	m.Gauge("banoor_generation", "Generation of the served list.")
 	m.Gauge("banoor_list_generated_timestamp_seconds", "When the served list was signed.")
 	m.Gauge("banoor_entries", "Entries in the served list, by kind (ipv4, ipv6, range) and source.")
 	m.Counter("banoor_new_bans_total", "Bans issued by the scorer, by kind.")
-	m.Gauge("banoor_suppressed", "Sources over the threshold, and manual bans, kept off the list by the allowlist or a lift.")
-	m.Counter("banoor_suppressed_total", "Times a source was first kept off the list by the allowlist or a lift.")
+	m.Gauge("banoor_suppressed", "Sources over the threshold, bans in force and manual bans kept off the list by the allowlist or a lift.")
+	m.Counter("banoor_suppressed_total", "Times a source or ban was first kept off the list by the allowlist or a lift.")
 	m.Gauge("banoor_deferred", "Entries held back by a cap, by reason.")
 	m.Counter("banoor_deferred_total", "Times an entry was first held back by a cap, by reason.")
 	m.Counter("banoor_signal_would_ban_total", "Times a shadow signal would first have banned a source, by signal.")
 	m.Gauge("banoor_scored_sources", "Sources with any points in the window.")
-	m.Counter("banoor_invalid_addresses_total", "Signal rows whose address did not parse.")
+	m.Gauge("banoor_invalid_rows", "Signal rows in the window that could not be scored: an address that does not parse, or attempts that are NULL, NaN, infinite or negative.")
 	m.Gauge("banoor_manual_entries", "Manual entries in force, by action.")
 	m.Gauge("banoor_manual_invalid", "Manual entries skipped as invalid.")
 	m.Gauge("banoor_allowlist_prefixes", "Allowlisted prefixes, by list.")
@@ -30,15 +31,6 @@ func (s *Scorer) defineMetrics() {
 	m.Counter("banoor_source_errors_total", "Failed queries and inserts, by query.")
 	m.Gauge("banoor_last_success_timestamp_seconds", "When a run last succeeded.")
 	m.Gauge("banoor_run_duration_seconds", "How long the last successful run took.")
-}
-
-func suppressedKeys(ss []engine.Suppression) []string {
-	out := make([]string, len(ss))
-	for i, s := range ss {
-		out[i] = s.Prefix.String()
-	}
-
-	return out
 }
 
 func strs(ps []netip.Prefix) []string {
@@ -58,15 +50,6 @@ var (
 
 func (s *Scorer) observe(res engine.Result, start time.Time) {
 	m := s.metrics
-
-	for _, mode := range modes {
-		v := 0.0
-		if mode == s.mode {
-			v = 1
-		}
-
-		m.Set("banoor_mode", v, "mode", string(mode))
-	}
 
 	if cur := s.Current(); cur != nil {
 		m.Set("banoor_generation", float64(cur.Generation))
@@ -107,9 +90,9 @@ func (s *Scorer) observe(res engine.Result, start time.Time) {
 	}
 
 	m.Set("banoor_scored_sources", float64(res.Scored))
-	m.Add("banoor_invalid_addresses_total", float64(res.Invalid))
+	m.Set("banoor_invalid_rows", float64(res.Invalid))
 
-	for _, a := range []string{"ban", "lift"} {
+	for _, a := range []string{manual.Ban, manual.Lift} {
 		m.Set("banoor_manual_entries", float64(res.ActiveManual[a]), "action", a)
 	}
 

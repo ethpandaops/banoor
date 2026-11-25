@@ -51,12 +51,12 @@ type Signal struct {
 
 // Caps bound what one step may publish and ban.
 type Caps struct {
-	MaxEntries             int
-	MaxAddedPerGeneration  int
-	MaxNewPerHour          int
-	MaxNewPerFeederPerHour int
-	MaxIPv4Addresses       uint64
-	MaxIPv6Networks        uint64
+	MaxEntries             int    `json:"maxEntries"`
+	MaxAddedPerGeneration  int    `json:"maxAddedPerGeneration"`
+	MaxNewPerHour          int    `json:"maxNewPerHour"`
+	MaxNewPerFeederPerHour int    `json:"maxNewPerFeederPerHour"`
+	MaxIPv4Addresses       uint64 `json:"maxIPv4Addresses"`
+	MaxIPv6Networks        uint64 `json:"maxIPv6Networks"`
 }
 
 // Config is the scoring policy.
@@ -71,7 +71,7 @@ type Config struct {
 	Signals      []Signal
 }
 
-// Row is one signal's count for one source and feeder over the window. The
+// Row is one signal's count for one address and feeder over the window. The
 // feeder is whoever reported the attempts, such as a host; caps on new bans
 // are kept per feeder.
 type Row struct {
@@ -80,13 +80,51 @@ type Row struct {
 	Attempts float64
 }
 
+// Tally sums one signal's rows per source and feeder as they are read, so
+// what a step holds grows with the sources, not with how many addresses of
+// one source the query returns.
+type Tally struct {
+	ipv6Prefix int
+	attempts   map[tallyKey]float64
+	invalid    int
+}
+
+type tallyKey struct {
+	unit   netip.Prefix
+	feeder string
+}
+
+// NewTally returns an empty tally of this engine's sources.
+func (e *Engine) NewTally() *Tally {
+	return &Tally{ipv6Prefix: e.cfg.IPv6Prefix, attempts: map[tallyKey]float64{}}
+}
+
+// Add counts one row. A row whose address does not parse, or whose attempts
+// are NaN (as NULL arrives), infinite or negative, counts as invalid.
+func (t *Tally) Add(r Row) {
+	u, err := netaddr.Unit(r.Address, t.ipv6Prefix)
+	if err != nil || math.IsNaN(r.Attempts) || math.IsInf(r.Attempts, 0) || r.Attempts < 0 {
+		t.invalid++
+
+		return
+	}
+
+	t.attempts[tallyKey{unit: u, feeder: r.Feeder}] += r.Attempts
+}
+
 // Inputs is everything one step reads.
 type Inputs struct {
-	Now    time.Time
-	Mode   Mode
-	Rows   map[string][]Row
-	Allow  *netaddr.Set
-	Manual []manual.Entry
+	Now  time.Time
+	Mode Mode
+	// Tallies are the signals' rows, by signal name. A signal without one
+	// gives no points.
+	Tallies map[string]*Tally
+	Allow   *netaddr.Set
+	Manual  []manual.Entry
+	// NoNewDecisions issues no bans and reports no newly seen manual
+	// entries, for a step whose decisions cannot be recorded. Its list still
+	// drops what has expired, been lifted or been allowed.
+	NoNewDecisions bool
 }
 
 // Ban is one scored ban.
@@ -118,7 +156,7 @@ const (
 	SourceManual = "manual"
 )
 
-// Suppression is a source or manual ban kept off the list.
+// Suppression is a source, a ban in force or a manual ban kept off the list.
 type Suppression struct {
 	Prefix netip.Prefix
 	Points float64
@@ -151,8 +189,8 @@ type Result struct {
 	NewBans   []Ban
 	NewManual []manual.Entry
 	Entries   []Entry
-	// Suppressed are sources over the threshold, and manual bans, that the
-	// allowlist or a lift keeps off the list.
+	// Suppressed are sources over the threshold, bans in force and manual
+	// bans that the allowlist or a lift keeps off the list.
 	Suppressed []Suppression
 	// Deferred are entries a cap holds back, by reason. They are considered
 	// again at the next step.
@@ -161,7 +199,8 @@ type Result struct {
 	WouldBan map[string][]netip.Prefix
 	// Scored counts sources with any points from counting signals.
 	Scored int
-	// Invalid counts rows whose address did not parse.
+	// Invalid counts rows that could not be scored: their address did not
+	// parse, or their attempts were not a count.
 	Invalid int
 	// ActiveManual counts manual entries in force, by action.
 	ActiveManual map[string]int
@@ -211,8 +250,18 @@ func (e *Engine) Restore(bans []Ban, manualKeys, published []string) {
 	e.setPublished(published)
 }
 
+// record adds a ban. One issued while the unit's recorded ban was still in
+// force is that ban recorded twice, as when an insert lands but reports an
+// error and the next step issues it again: it replaces the earlier record
+// and does not count as a repeat or toward the hourly caps.
 func (e *Engine) record(b Ban) {
+	earlier, ok := e.bans[b.Unit]
 	e.bans[b.Unit] = b
+
+	if ok && b.Issued.Before(earlier.Expires) {
+		return
+	}
+
 	e.history[b.Unit] = append(e.history[b.Unit], b.Issued)
 
 	feeder := ""
@@ -258,11 +307,17 @@ func (e *Engine) Step(in Inputs) Result {
 
 	scores, shadow := e.score(in, &res)
 	v := e.manualView(in, &res)
+
+	// Nothing is banned that consumers would not be sent, or that could not
+	// be recorded.
 	cands := e.candidates(in.Now, scores, v, &res)
+	if in.Mode == Empty || in.NoNewDecisions {
+		cands = nil
+	}
 
 	var listed *netaddr.Set
 
-	res.Entries, listed = e.admit(in.Mode, in.Now, e.items(in.Now, v, cands), &res)
+	res.Entries, listed = e.admit(in.Mode, in.Now, e.items(in.Now, v, cands, &res), &res)
 	e.wouldBan(in.Now, scores, shadow, v, listed, &res)
 
 	slices.SortFunc(res.Suppressed, func(a, b Suppression) int {
@@ -307,7 +362,7 @@ func (e *Engine) score(in Inputs, res *Result) (map[netip.Prefix]*candidate, map
 	shadow := map[string]map[netip.Prefix]float64{}
 
 	for _, sig := range e.cfg.Signals {
-		points := e.scoreSignal(sig, in.Rows[sig.Name], scores, res)
+		points := e.scoreSignal(sig, in.Tallies[sig.Name], scores, res)
 
 		if sig.Shadow {
 			shadow[sig.Name] = points
@@ -331,32 +386,30 @@ func (e *Engine) score(in Inputs, res *Result) (map[netip.Prefix]*candidate, map
 
 // scoreSignal returns one signal's points per source, capped, and adds a
 // counting signal's attempts and feeders to the candidates.
-func (e *Engine) scoreSignal(sig Signal, rows []Row, scores map[netip.Prefix]*candidate, res *Result) map[netip.Prefix]float64 {
+func (e *Engine) scoreSignal(sig Signal, t *Tally, scores map[netip.Prefix]*candidate, res *Result) map[netip.Prefix]float64 {
 	points := map[netip.Prefix]float64{}
+	if t == nil {
+		return points
+	}
 
-	for _, r := range rows {
-		u, err := netaddr.Unit(r.Address, e.cfg.IPv6Prefix)
-		if err != nil || math.IsNaN(r.Attempts) || math.IsInf(r.Attempts, 0) || r.Attempts < 0 {
-			res.Invalid++
+	res.Invalid += t.invalid
 
-			continue
-		}
-
-		p := sig.Weight * r.Attempts
-		points[u] += p
+	for k, attempts := range t.attempts {
+		p := sig.Weight * attempts
+		points[k.unit] += p
 
 		if sig.Shadow {
 			continue
 		}
 
-		c := scores[u]
+		c := scores[k.unit]
 		if c == nil {
-			c = &candidate{unit: u, signals: map[string]float64{}, feeders: map[string]float64{}}
-			scores[u] = c
+			c = &candidate{unit: k.unit, signals: map[string]float64{}, feeders: map[string]float64{}}
+			scores[k.unit] = c
 		}
 
-		c.signals[sig.Name] += r.Attempts
-		c.feeders[r.Feeder] += p
+		c.signals[sig.Name] += attempts
+		c.feeders[k.feeder] += p
 	}
 
 	if sig.Cap > 0 {
@@ -401,7 +454,7 @@ func (e *Engine) manualView(in Inputs, res *Result) view {
 		active = append(active, m)
 		res.ActiveManual[m.Action]++
 
-		if !e.seenManual[m.Key()] {
+		if !e.seenManual[m.Key()] && !in.NoNewDecisions {
 			res.NewManual = append(res.NewManual, m)
 		}
 
@@ -484,8 +537,9 @@ type item struct {
 }
 
 // items is everything that could be published, in priority order: manual
-// bans, then scored bans and candidates by points.
-func (e *Engine) items(now time.Time, v view, cands []*candidate) []item {
+// bans, then scored bans and candidates by points. Bans in force that the
+// allowlist or a lift now covers are suppressed.
+func (e *Engine) items(now time.Time, v view, cands []*candidate, res *Result) []item {
 	out := make([]item, 0, len(v.bans)+len(e.bans)+len(cands))
 
 	for _, m := range v.bans {
@@ -495,7 +549,13 @@ func (e *Engine) items(now time.Time, v view, cands []*candidate) []item {
 	}
 
 	for _, b := range e.bans {
-		if !b.Expires.After(now) || v.blocked(b.Unit) {
+		if !b.Expires.After(now) {
+			continue
+		}
+
+		if v.blocked(b.Unit) {
+			res.Suppressed = append(res.Suppressed, Suppression{Prefix: b.Unit, Points: b.Points, By: v.by(b.Unit)})
+
 			continue
 		}
 
