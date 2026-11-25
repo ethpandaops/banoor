@@ -162,4 +162,15 @@ func TestGenerations(t *testing.T) {
 	if got := publish(t, p, later.Add(time.Second), engine.Shadow, entry("198.51.100.1/32"), entry("198.51.100.2/32")); got == nil || got.Generation != unixSeconds(later)+1 {
 		t.Fatalf("mode change = %+v", got)
 	}
+
+	// The clock steps back a minute: the list it signed is from the future,
+	// so it is signed again at once, in the same generation.
+	gen := p.Current().Generation
+	if got := publish(t, p, later.Add(-time.Minute), engine.Shadow, entry("198.51.100.1/32"), entry("198.51.100.2/32")); got != nil {
+		t.Fatalf("a clock step cut generation %+v", got)
+	}
+
+	if back, _ := decode(t, p.Current()); back.Generation != gen || back.GeneratedAt != later.Add(-time.Minute).Unix() {
+		t.Fatalf("after the clock stepped back: generation %d at %d", back.Generation, back.GeneratedAt)
+	}
 }
