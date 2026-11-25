@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: stable
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.15.0
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go: [oldstable, stable]
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.3
+        env:
+          CLICKHOUSE_USER: banoor
+          CLICKHOUSE_PASSWORD: banoor
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "wget -qO- http://127.0.0.1:8123/ping"
+          --health-interval 5s
+          --health-retries 20
+    env:
+      BANOOR_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
+      BANOOR_TEST_CLICKHOUSE_USER: banoor
+      BANOOR_TEST_CLICKHOUSE_PASSWORD: banoor
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: ${{ matrix.go }}
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+
