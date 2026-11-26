@@ -42,8 +42,9 @@ when it has no good copy yet, or record a new generation, publishes nothing:
 the served list ages and consumers keep what they hold.
 
 On start, banoord rebuilds its bans, manual entries, fetchers and generation
-from the tables, skipping any ban it could not have issued: wider than one
-source, issued in the future, or longer than `ban.max`. Run one banoord per
+from the tables, skipping any ban it could not have issued (wider than one
+source, issued in the future, or longer than `ban.max`) and any generation
+more than an hour ahead of the clock. Run one banoord per
 set of state tables: two would each serve their own list. Its ClickHouse
 user needs to read the signal and allow tables and write the state tables;
 give operators insert on the control table alone, and log shippers insert on
@@ -70,7 +71,7 @@ ends; attempts made during a ban count toward the next.
 | `source.insertSettings` | | sent with every insert, such as `distributed_foreground_insert` for Distributed tables |
 | `tables.decisions`, `tables.publishes`, `tables.control` | | state tables |
 | `tables.fetchers` | | with `allow.fetchers` |
-| `signing.keyFile` | | unencrypted OpenSSH Ed25519 private key |
+| `signing.keyFile` | | unencrypted OpenSSH Ed25519 private key; to rotate it, see [the list format](list-format.md#rotating-the-signing-key) |
 | `signing.namespace` | | the namespace consumers verify with `-n` |
 | `defaultMode` | `shadow` | mode while the control table is empty |
 | `threshold` | `50` | points that ban a source |
@@ -244,6 +245,10 @@ It fails on invalid or too-wide entries, bans that overlap the allowlist or a
 lift, and expiries more than `-max-ahead` away (a year by default), and warns
 about expired entries.
 
+The allowlist still wins over a manual ban once it is in force: an allow
+query or a fetcher can come to cover it later. banoord then keeps the ban off
+the list, logs a warning, and counts it in `banoor_manual_allowlisted`.
+
 ## The kill switch
 
 ```sql
@@ -269,6 +274,7 @@ list applies at once.
 | `banoor_entries{kind,source}` | entries by kind (`ipv4`, `ipv6`, `range`) and source |
 | `banoor_new_bans_total{kind}` | bans issued |
 | `banoor_suppressed`, `banoor_suppressed_total` | sources, bans in force and manual bans the allowlist or a lift keeps off |
+| `banoor_manual_allowlisted` | manual bans in force the allowlist keeps off; each is also logged as a warning |
 | `banoor_deferred{reason}`, `banoor_deferred_total{reason}` | entries a cap holds back |
 | `banoor_signal_would_ban_total{signal}` | sources a shadow signal would have banned |
 | `banoor_scored_sources` | sources with points in the window |

@@ -32,7 +32,7 @@ always match:
 | Field | Meaning |
 | --- | --- |
 | `version` | 1. Fields may be added within version 1; ignore ones you do not know. |
-| `generation` | Only goes up. It changes when `entries` or `mode` change, and when banoord restarts. It is the Unix time of the change, or the previous generation plus one if that is higher, so it keeps going up even if banoord loses its state. |
+| `generation` | Only goes up. It changes when `entries` or `mode` change, and when banoord restarts. It is the Unix time of the change, or the previous generation plus one if that is higher, so it keeps going up even if banoord loses its state. It is never more than an hour ahead of `generated_at`: on start, banoord ignores a recorded generation further ahead than that. |
 | `previous_generation` | The generation this one replaces; 0 for the first. |
 | `generated_at` | When this payload was signed, in Unix seconds. An unchanged list is signed again every `refresh` (60 s by default) with the same generation. |
 | `mode` | `enforce`: apply the list in your own mode. `shadow`: load it, drop nothing. `empty`: `entries` is `[]`. |
@@ -65,9 +65,13 @@ ssh-keygen -Y verify -f allowed_signers -I list-signer -n example-banlist -s pay
 1. The signature, against the pinned key or keys (several, to rotate).
 2. `generated_at`: reject a payload older than a few refresh intervals (10
    minutes, say), or from the future.
-3. `generation`: reject one lower than the last you loaded, and remember it
-   across restarts. An equal one is a freshness refresh: reset your age and
-   change nothing.
+3. `generation`: reject one above `generated_at` plus a day, or above 2^53
+   (so every JSON parser reads it exactly). Reject one lower than the last
+   you loaded from the same key, and remember that floor per key across
+   restarts. An equal one from the same key is a freshness refresh: reset
+   your age and change nothing. With a floor per key, a generation pushed far
+   ahead under one key stops only that key's lists, and switching keys
+   recovers.
 4. Your own limits before loading: the widest prefix, the number of entries,
    total coverage, and how many entries a list adds when your loaded
    generation equals `previous_generation`. Skip the last check on your first
@@ -79,3 +83,17 @@ ssh-keygen -Y verify -f allowed_signers -I list-signer -n example-banlist -s pay
 banoord's caps keep its lists inside defaults of /24 and /48, 5,000 entries,
 2^20 IPv4 addresses or IPv6 /64 networks, and 500 additions per generation;
 configure the same limits on both sides.
+
+## Rotating the signing key
+
+Pin two keys on every consumer: the active one and a standby whose private
+half is kept offline. Then:
+
+1. Switch banoord to the standby key (`signing.keyFile`) once every consumer
+   pins it. Consumers accept its lists at once.
+2. Make a new standby key and pin it on every consumer.
+3. Unpin the old key.
+
+Never switch to a key a consumer does not pin yet: it rejects every list,
+lifts and the kill switch included, until it does. Without a standby, a
+compromised key stays trusted until a new pin reaches every consumer.

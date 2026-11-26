@@ -11,8 +11,10 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ethpandaops/banoor/internal/clickhouse"
 	"github.com/ethpandaops/banoor/internal/config"
@@ -44,12 +46,14 @@ func TestClickHouse(t *testing.T) {
 	}
 
 	// Recorded before this scorer ran: the manual ban, longer ago than any
-	// ban lookback, and two generations, the higher one written first and
-	// holding .1.
+	// ban lookback, and three generations: the highest far in the future (not
+	// banoord's), one a minute ahead holding .1, and a lower one written
+	// after it.
 	execSQL(t, ch, "INSERT INTO "+db+`.decisions (Time, Generation, Action, Cidr, Expires, Mode, Reason) VALUES
 		(now64(3) - INTERVAL 60 DAY, 0, 'manual_ban', '203.0.113.0/24', toDateTime('2099-01-01 00:00:00', 'UTC'), 'shadow', 'range')`)
 	execSQL(t, ch, "INSERT INTO "+db+`.publishes (Time, Generation, Cidrs) VALUES
-		(now64(3) - INTERVAL 2 HOUR, 4000000000, ['198.51.100.1/32']), (now64(3) - INTERVAL 1 HOUR, 5, [])`)
+		(now64(3) - INTERVAL 2 HOUR, toUnixTimestamp(now()) + 60, ['198.51.100.1/32']), (now64(3) - INTERVAL 1 HOUR, 5, []),
+		(now64(3) - INTERVAL 3 HOUR, 9223372036854775808, ['192.0.2.0/24'])`)
 
 	sc := newScorer()
 	sc.Seen("host-b", "198.51.100.5") // would be banned; fetched the list
@@ -60,8 +64,8 @@ func TestClickHouse(t *testing.T) {
 		t.Fatalf("entries = %v in %s, want %v in the default mode", got, first.Mode, want)
 	}
 
-	if first.PreviousGeneration != 4000000000 || first.Generation != 4000000001 {
-		t.Fatalf("generation %d follows %d, want 4000000001 after the highest recorded", first.Generation, first.PreviousGeneration)
+	if ahead := time.Until(time.Unix(int64(first.PreviousGeneration), 0)); first.Generation != first.PreviousGeneration+1 || ahead <= 0 || ahead > 2*time.Minute { //nolint:gosec // a Unix time, far below 2^63
+		t.Fatalf("generation %d follows %d, want one after the generation a minute ahead", first.Generation, first.PreviousGeneration)
 	}
 
 	// Two bans and .5's suppression, but not the manual ban again; one
@@ -71,7 +75,7 @@ func TestClickHouse(t *testing.T) {
 		t.Fatalf("decisions %d, fetchers %d", d, f)
 	}
 
-	if n := countRows(t, ch, db+".publishes WHERE Generation = 4000000001 AND Added = 2 AND length(Cidrs) = 3"); n != 1 {
+	if n := countRows(t, ch, db+".publishes WHERE Generation = "+strconv.FormatUint(first.Generation, 10)+" AND Added = 2 AND length(Cidrs) = 3"); n != 1 {
 		t.Fatal("the generation was not recorded with its prefixes and its additions over the last published list")
 	}
 

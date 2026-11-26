@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -39,7 +40,7 @@ func newFakeSource(results map[string][]map[string]any) *fakeSource {
 	return &fakeSource{results: results, inserted: map[string][][]any{}, failWrite: map[string]bool{}, failQuery: map[string]bool{}}
 }
 
-func (f *fakeSource) Select(_ context.Context, query string, _ map[string]string, row func(map[string]any) error) error {
+func (f *fakeSource) Select(_ context.Context, query string, params map[string]string, row func(map[string]any) error) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -53,10 +54,7 @@ func (f *fakeSource) Select(_ context.Context, query string, _ map[string]string
 			rows = []map[string]any{{"mode": f.mode}}
 		}
 	case strings.Contains(query, "FROM state.publishes"):
-		if n := len(f.inserted["state.publishes"]); n > 0 {
-			last := f.inserted["state.publishes"][n-1]
-			rows = []map[string]any{{"generation": last[1], "cidrs": last[9]}}
-		}
+		rows = []map[string]any{f.lastPublish(params["bound"])}
 	case strings.Contains(query, "FROM state.fetchers"):
 		latest := map[[2]any]time.Time{}
 
@@ -93,6 +91,36 @@ func (f *fakeSource) Select(_ context.Context, query string, _ map[string]string
 	}
 
 	return nil
+}
+
+// lastPublish answers the restore query: the highest recorded generation
+// below bound, its prefixes, and how many were at or above it.
+func (f *fakeSource) lastPublish(bound string) map[string]any {
+	limit, err := strconv.ParseUint(bound, 10, 64)
+	if err != nil {
+		panic(err)
+	}
+
+	var (
+		last, beyond uint64
+		cidrs        any = []string{}
+	)
+
+	for _, p := range f.inserted["state.publishes"] {
+		g, ok := p[1].(uint64)
+		if !ok {
+			panic("generation is not a uint64")
+		}
+
+		switch {
+		case g >= limit:
+			beyond++
+		case g >= last:
+			last, cidrs = g, p[9]
+		}
+	}
+
+	return map[string]any{"generation": last, "cidrs": cidrs, "beyond": beyond}
 }
 
 func asTime(v any) time.Time {
@@ -542,6 +570,36 @@ func TestBrokenManualListKeepsTheLastGood(t *testing.T) {
 	}
 }
 
+func TestAllowlistedManualBanIsReported(t *testing.T) {
+	t.Parallel()
+
+	_, key, _ := ed25519.GenerateKey(rand.Reader)
+	h := newHarness(t, testSource(), key, filepath.Join(t.TempDir(), "manual.json"))
+	h.writeManual(`{"entries": [
+		{"action": "ban", "cidr": "203.0.113.0/24", "expires": "2030-01-08T00:00:00Z", "reason": "scanner range"},
+		{"action": "ban", "cidr": "192.0.2.0/24", "expires": "2030-01-08T00:00:00Z", "reason": "lifted range"},
+		{"action": "lift", "cidr": "192.0.2.7/32", "expires": "2030-01-08T00:00:00Z", "reason": "customer"}
+	]}`)
+
+	if err := os.WriteFile(filepath.Join(h.allowDir, "ours.txt"), []byte("203.0.113.40\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.run(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := cidrs(h.payload()); slices.Contains(got, "203.0.113.0/24") || slices.Contains(got, "192.0.2.0/24") {
+		t.Fatalf("entries = %v, want both manual bans kept off", got)
+	}
+
+	// Only the one the allowlist keeps off counts; a lift is the operator's
+	// own choice.
+	if got := metricsText(t, h.reg); !strings.Contains(got, "banoor_manual_allowlisted 1\n") {
+		t.Fatalf("metrics lack banoor_manual_allowlisted 1:\n%s", got)
+	}
+}
+
 func TestBrokenAllowlistKeepsTheLastGood(t *testing.T) {
 	t.Parallel()
 
@@ -691,6 +749,32 @@ func TestRestoreSkipsBansItCouldNotHaveIssued(t *testing.T) {
 
 	if got := cidrs(h.payload()); !slices.Equal(got, []string{"198.51.100.1/32"}) {
 		t.Fatalf("entries = %v, want only the ban a scorer could have issued", got)
+	}
+}
+
+func TestRestoreSkipsFarFutureGenerations(t *testing.T) {
+	t.Parallel()
+
+	_, key, _ := ed25519.GenerateKey(rand.Reader)
+	src := testSource()
+	const near uint64 = t0Unix + 1800
+	src.inserted["state.publishes"] = [][]any{
+		{t0, near, uint64(0), "shadow", uint32(0), uint32(0), uint32(0), uint32(0), "", []string{}},
+		{t0, uint64(1) << 63, near, "shadow", uint32(0), uint32(0), uint32(0), uint32(0), "", []string{}},
+		{t0, uint64(t0Unix + 3600), near, "shadow", uint32(0), uint32(0), uint32(0), uint32(0), "", []string{}},
+	}
+
+	h := newHarness(t, src, key, filepath.Join(t.TempDir(), "manual.json"))
+	h.writeManual(`{"entries": []}`)
+
+	if err := h.run(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A generation at or beyond an hour ahead was not banoord's; one 30
+	// minutes ahead was, and the next follows it.
+	if p := h.payload(); p.PreviousGeneration != near || p.Generation != near+1 {
+		t.Fatalf("generation %d after %d, want %d after %d", p.Generation, p.PreviousGeneration, near+1, near)
 	}
 }
 
