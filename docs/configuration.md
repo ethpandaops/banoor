@@ -42,8 +42,9 @@ when it has no good copy yet, or record a new generation, publishes nothing:
 the served list ages and consumers keep what they hold.
 
 On start, banoord rebuilds its bans, manual entries, fetchers and generation
-from the tables, skipping any ban it could not have issued: wider than one
-source, issued in the future, or longer than `ban.max`. Run one banoord per
+from the tables, skipping any ban it could not have issued (wider than one
+source, issued in the future, or longer than `ban.max`) and any generation
+more than an hour ahead of the clock. Run one banoord per
 set of state tables: two would each serve their own list. Its ClickHouse
 user needs to read the signal and allow tables and write the state tables;
 give operators insert on the control table alone, and log shippers insert on
@@ -70,7 +71,7 @@ ends; attempts made during a ban count toward the next.
 | `source.insertSettings` | | sent with every insert, such as `distributed_foreground_insert` for Distributed tables |
 | `tables.decisions`, `tables.publishes`, `tables.control` | | state tables |
 | `tables.fetchers` | | with `allow.fetchers` |
-| `signing.keyFile` | | unencrypted OpenSSH Ed25519 private key |
+| `signing.keyFile` | | unencrypted OpenSSH Ed25519 private key; to rotate it, see [the list format](list-format.md#rotating-the-signing-key) |
 | `signing.namespace` | | the namespace consumers verify with `-n` |
 | `defaultMode` | `shadow` | mode while the control table is empty |
 | `threshold` | `50` | points that ban a source |

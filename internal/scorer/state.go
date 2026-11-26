@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"strconv"
 	"time"
 
 	"github.com/ethpandaops/banoor/internal/publish"
@@ -27,11 +28,19 @@ var decisionColumns = []string{"Time", "Generation", "Action", "Cidr", "Points",
 
 var publishColumns = []string{"Time", "Generation", "PreviousGeneration", "Mode", "Entries", "Added", "Removed", "Deferred", "PayloadSha256", "Cidrs"}
 
+// maxGenerationLead is how far ahead of the clock a restored generation may
+// be. A generation is the Unix time of a change, or one more than the last
+// if that is higher, so a recorded generation further ahead was not written
+// by banoord; continuing from it would push consumers' replay floor into
+// the future.
+const maxGenerationLead = time.Hour
+
 // restore rebuilds the engine and the generation sequence from the state
 // tables: the bans within the longest window that matters, every manual
 // entry still in force, and the last published list. A ban this
 // configuration could not have issued at now, such as a range or one dated
-// in the future, is skipped.
+// in the future, is skipped, and so is a generation more than
+// maxGenerationLead ahead.
 func (s *Scorer) restore(ctx context.Context, now time.Time) error {
 	lookback := max(s.cfg.Ban.RepeatWindow.Duration, s.cfg.Ban.Max.Duration)
 	q := fmt.Sprintf(`SELECT toUnixTimestamp64Milli(Time) AS time_ms, Action AS action, Cidr AS cidr, Points AS points,
@@ -87,12 +96,17 @@ ORDER BY Time`, s.cfg.Tables.Decisions, actionBan, actionManualBan, actionManual
 	var (
 		last      uint64
 		published []string
+		beyond    int64
 	)
 
-	q = fmt.Sprintf("SELECT Generation AS generation, Cidrs AS cidrs FROM %s ORDER BY Generation DESC LIMIT 1", s.cfg.Tables.Publishes)
+	q = `SELECT maxIf(Generation, Generation < {bound:UInt64}) AS generation,
+	argMaxIf(Cidrs, Generation, Generation < {bound:UInt64}) AS cidrs,
+	countIf(Generation >= {bound:UInt64}) AS beyond
+FROM ` + s.cfg.Tables.Publishes
+	bound := strconv.FormatInt(now.Add(maxGenerationLead).Unix(), 10)
 
-	err = s.src.Select(ctx, q, nil, func(row map[string]any) error {
-		last, published = uint64(max(integer(row["generation"]), 0)), strList(row["cidrs"])
+	err = s.src.Select(ctx, q, map[string]string{"bound": bound}, func(row map[string]any) error {
+		last, published, beyond = uint64(max(integer(row["generation"]), 0)), strList(row["cidrs"]), integer(row["beyond"])
 
 		return nil
 	})
@@ -100,6 +114,10 @@ ORDER BY Time`, s.cfg.Tables.Decisions, actionBan, actionManualBan, actionManual
 		s.metrics.Add("banoor_source_errors_total", 1, "query", "publishes")
 
 		return err
+	}
+
+	if beyond > 0 {
+		s.log.WarnContext(ctx, "skipping recorded generations more than an hour ahead of the clock", "count", beyond, "bound", bound)
 	}
 
 	if err = s.restoreFetchers(ctx); err != nil {
