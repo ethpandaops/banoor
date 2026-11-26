@@ -249,7 +249,11 @@ func (s *Scorer) reportSuppressed(ctx context.Context, res engine.Result) {
 			reason = "manual ban kept off " + reason
 		}
 
-		s.log.InfoContext(ctx, "suppressed", "cidr", sup.Prefix.String(), "points", sup.Points, "by", sup.By, "manual", sup.Manual)
+		if sup.Manual && sup.By == engine.SuppressedByAllowlist {
+			s.log.WarnContext(ctx, "manual ban kept off the list by the allowlist", "cidr", sup.Prefix.String())
+		} else {
+			s.log.InfoContext(ctx, "suppressed", "cidr", sup.Prefix.String(), "points", sup.Points, "by", sup.By, "manual", sup.Manual)
+		}
 		rows = append(rows, []any{
 			res.Now, uint64(0), actionSuppressed, sup.Prefix.String(), sup.Points,
 			[]string{},

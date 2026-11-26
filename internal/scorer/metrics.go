@@ -19,6 +19,7 @@ func (s *Scorer) defineMetrics() {
 	m.Counter("banoor_new_bans_total", "Bans issued by the scorer, by kind.")
 	m.Gauge("banoor_suppressed", "Sources over the threshold, bans in force and manual bans kept off the list by the allowlist or a lift.")
 	m.Counter("banoor_suppressed_total", "Times a source or ban was first kept off the list by the allowlist or a lift.")
+	m.Gauge("banoor_manual_allowlisted", "Manual bans in force that the allowlist keeps off the list.")
 	m.Gauge("banoor_deferred", "Entries held back by a cap, by reason.")
 	m.Counter("banoor_deferred_total", "Times an entry was first held back by a cap, by reason.")
 	m.Counter("banoor_signal_would_ban_total", "Times a shadow signal would first have banned a source, by signal.")
@@ -75,6 +76,16 @@ func (s *Scorer) observe(res engine.Result, start time.Time) {
 	}
 
 	m.Set("banoor_suppressed", float64(len(res.Suppressed)))
+
+	allowlisted := 0
+
+	for _, sup := range res.Suppressed {
+		if sup.Manual && sup.By == engine.SuppressedByAllowlist {
+			allowlisted++
+		}
+	}
+
+	m.Set("banoor_manual_allowlisted", float64(allowlisted))
 
 	for _, reason := range engine.DeferReasons {
 		units := res.Deferred[reason]

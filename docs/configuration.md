@@ -245,6 +245,10 @@ It fails on invalid or too-wide entries, bans that overlap the allowlist or a
 lift, and expiries more than `-max-ahead` away (a year by default), and warns
 about expired entries.
 
+The allowlist still wins over a manual ban once it is in force: an allow
+query or a fetcher can come to cover it later. banoord then keeps the ban off
+the list, logs a warning, and counts it in `banoor_manual_allowlisted`.
+
 ## The kill switch
 
 ```sql
@@ -270,6 +274,7 @@ list applies at once.
 | `banoor_entries{kind,source}` | entries by kind (`ipv4`, `ipv6`, `range`) and source |
 | `banoor_new_bans_total{kind}` | bans issued |
 | `banoor_suppressed`, `banoor_suppressed_total` | sources, bans in force and manual bans the allowlist or a lift keeps off |
+| `banoor_manual_allowlisted` | manual bans in force the allowlist keeps off; each is also logged as a warning |
 | `banoor_deferred{reason}`, `banoor_deferred_total{reason}` | entries a cap holds back |
 | `banoor_signal_would_ban_total{signal}` | sources a shadow signal would have banned |
 | `banoor_scored_sources` | sources with points in the window |

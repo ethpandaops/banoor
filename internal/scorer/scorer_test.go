@@ -570,6 +570,36 @@ func TestBrokenManualListKeepsTheLastGood(t *testing.T) {
 	}
 }
 
+func TestAllowlistedManualBanIsReported(t *testing.T) {
+	t.Parallel()
+
+	_, key, _ := ed25519.GenerateKey(rand.Reader)
+	h := newHarness(t, testSource(), key, filepath.Join(t.TempDir(), "manual.json"))
+	h.writeManual(`{"entries": [
+		{"action": "ban", "cidr": "203.0.113.0/24", "expires": "2030-01-08T00:00:00Z", "reason": "scanner range"},
+		{"action": "ban", "cidr": "192.0.2.0/24", "expires": "2030-01-08T00:00:00Z", "reason": "lifted range"},
+		{"action": "lift", "cidr": "192.0.2.7/32", "expires": "2030-01-08T00:00:00Z", "reason": "customer"}
+	]}`)
+
+	if err := os.WriteFile(filepath.Join(h.allowDir, "ours.txt"), []byte("203.0.113.40\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.run(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := cidrs(h.payload()); slices.Contains(got, "203.0.113.0/24") || slices.Contains(got, "192.0.2.0/24") {
+		t.Fatalf("entries = %v, want both manual bans kept off", got)
+	}
+
+	// Only the one the allowlist keeps off counts; a lift is the operator's
+	// own choice.
+	if got := metricsText(t, h.reg); !strings.Contains(got, "banoor_manual_allowlisted 1\n") {
+		t.Fatalf("metrics lack banoor_manual_allowlisted 1:\n%s", got)
+	}
+}
+
 func TestBrokenAllowlistKeepsTheLastGood(t *testing.T) {
 	t.Parallel()
 
